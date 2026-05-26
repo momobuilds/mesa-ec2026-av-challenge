@@ -88,11 +88,10 @@ def render_bev_frames(
             print(f"  Saved {out_path.name} (no tracks)")
             continue
 
-        closest_rows = (
-            alive.groupby("track_id")
-            .apply(lambda g: g.iloc[(g["timestamp_ns"] - ts).abs().argmin()])
-            .reset_index(drop=True)
+        idx = alive.groupby("track_id")["timestamp_ns"].apply(
+            lambda s: (s - ts).abs().idxmin()
         )
+        closest_rows = alive.loc[idx.values].reset_index(drop=True)
 
         for _, row in closest_rows.iterrows():
             cx, cy = row["center_x"], row["center_y"]
