@@ -144,3 +144,41 @@ uv run python -m src.motion_model
 - LiDAR provides position; radar provides Doppler velocity. Cross-sensor EKF update is architecture-ready
   but radar positions don't spatially match LiDAR vehicle clusters in this bag (barrier returns).
 - Tasks 1 and 2 are unchanged; `scripts/run_task1.py` and `scripts/run_task2.py` work as before.
+
+---
+
+## Task 4: Environment Mapping (Bonus)
+
+Builds a probabilistic occupancy grid from the three LiDAR sensors,
+accumulated in the world frame with dynamic-object masking from Task 3.
+
+### Task 4 — Run
+
+```bash
+uv run python scripts/run_task4.py --bag-dir data --max-frames 60 \
+    --output-dir outputs/task4
+```
+
+Full-bag run (240 s, needs larger grid):
+
+```bash
+uv run python scripts/run_task4.py --bag-dir data --max-frames 9999 \
+    --grid-extent 700 --output-dir outputs/task4_full
+```
+
+Skip animation for speed: `--no-animation`
+
+### Task 4 — Outputs
+
+- `outputs/task4/world_map_static.png` — final occupancy map with boundary polylines
+- `outputs/task4/world_map_with_trajectory.png` — same + ego world-frame trajectory
+- `outputs/task4/track_boundaries.geojson` — inner + outer barrier polylines, world frame
+- `outputs/task4/ego_view_NNN.png` — ego-centred 100×60 m views at 8 evenly-spaced timestamps
+- `outputs/task4/map_animation.gif` — map filling in as ego drives (30 frames, 0.2 MB)
+- `outputs/task4/task4_report.md` — methodology, parameters, and quantitative results
+
+### Task 4 — Notes
+
+- Default grid: ±300 m, 0.25 m/cell → 2 400² cells (22 MB). Use `--grid-extent 700` for full-bag.
+- Dynamic-object masking requires `outputs/task3/tracks.csv` from Task 3. Skip with `--no-mask-tracks`.
+- Full-bag trajectory spans 671 m × 1 122 m; the 60-frame run covers ~240 m of the circuit.
