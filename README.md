@@ -32,11 +32,18 @@ uv run python scripts/run_task1.py --bag-dir data --topic /sensor/radar_front/po
 The default run writes:
 
 - `outputs/task1/detections.csv`
+- `outputs/task1/evaluation_summary.csv`
 - `outputs/task1/frame_000.png`, `frame_001.png`, ...
 - `outputs/task1/task1_report.md`
 
 The CSV columns include timestamp, detection id, BEV center position, axis-aligned
 bounding box limits, dimensions, point count, and a simple confidence score.
+
+The evaluation summary maps the generated outputs to the challenge criteria:
+accuracy, robustness, and false positive reduction. True precision/recall,
+position error, and IoU require ground-truth opponent annotations; until those
+are available, the report includes proxy run metrics and the filtering checks
+used to control false positives.
 
 ### Notes
 
