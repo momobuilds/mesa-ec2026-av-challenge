@@ -39,17 +39,13 @@ The default run writes:
 The CSV columns include timestamp, detection id, BEV center position, axis-aligned
 bounding box limits, dimensions, point count, and a simple confidence score.
 
-<<<<<<< HEAD
 The evaluation summary maps the generated outputs to the challenge criteria:
 accuracy, robustness, and false positive reduction. True precision/recall,
 position error, and IoU require ground-truth opponent annotations; until those
 are available, the report includes proxy run metrics and the filtering checks
 used to control false positives.
 
-### Notes
-=======
 ### Task 1 — Notes
->>>>>>> 8e6d383 (docs: Add Task 2 report and update README (phase 8))
 
 - The default topic is `/sensor/lidar_front/points` when available.
 - Ground-plane filtering is on by default; disable with `--no-ground-filter`.
