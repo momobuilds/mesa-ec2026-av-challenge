@@ -9,7 +9,7 @@ reused unchanged.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Iterator
 
 import numpy as np
 
@@ -28,6 +28,47 @@ from src.tf_utils import transform_points
 # side- and rear-mounted sensors.
 EGO_FORWARD_RANGE: tuple[float, float] = (-5.0, 95.0)   # x_ego (m)
 EGO_LATERAL_RANGE: tuple[float, float] = (-20.0, 20.0)  # y_ego (m)
+
+
+def iter_ego_frame_points(
+    summary: BagSummary,
+    topic: str,
+    *,
+    max_frames: int,
+) -> Iterator[tuple[int, np.ndarray]]:
+    """Yield (timestamp_ns, ego_xyz) for each frame of *topic*.
+
+    Returns full 3D ego-frame (N, 3) points without ground filtering.
+    The existing API (ego_bev_points, detect_topic_frames, detect_all_sensors)
+    is untouched.
+    """
+    reader = SQLitePointCloudReader(summary)
+    for msg_dict in reader.iter_pointcloud_messages(topic, max_frames=max_frames):
+        try:
+            structured = pointcloud2_to_structured_array(msg_dict["msg"])
+        except Exception:  # noqa: BLE001
+            continue
+        sensor_frame = msg_dict["source_frame"]
+        for fld in ("x", "y", "z"):
+            if fld not in structured.dtype.names:
+                import warnings
+                warnings.warn(
+                    f"iter_ego_frame_points: field '{fld}' missing in {topic} "
+                    f"frame {msg_dict.get('timestamp_ns')}; skipping",
+                    stacklevel=2,
+                )
+                break
+        else:
+            x_s = structured["x"].astype(np.float64)
+            y_s = structured["y"].astype(np.float64)
+            z_s = structured["z"].astype(np.float64)
+            finite = np.isfinite(x_s) & np.isfinite(y_s) & np.isfinite(z_s)
+            if finite.any():
+                ego_xyz = transform_points(
+                    np.column_stack([x_s[finite], y_s[finite], z_s[finite]]),
+                    sensor_frame,
+                )
+                yield msg_dict["timestamp_ns"], ego_xyz
 
 
 def ego_bev_points(
