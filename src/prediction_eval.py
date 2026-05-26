@@ -21,7 +21,7 @@ import numpy as np
 import pandas as pd
 
 from src.ego_trajectory import EgoTrajectory
-from src.task2_fusion import _X, _Y, _VX, _VY, _YAW
+from src.task2_fusion import _X, _Y, _YAW
 from src.tf_utils import EgoStateLog
 from src.trajectory_predictor import Prediction, TrajectoryPredictor
 
@@ -145,10 +145,14 @@ def run_evaluation(
                         # NLL under predicted 2D Gaussian
                         Sigma = pred.covariance[:2, :2]
                         try:
-                            Sigma_inv = np.linalg.inv(Sigma + np.eye(2) * 1e-6)
-                            sign, logdet = np.linalg.slogdet(Sigma + np.eye(2) * 1e-6)
-                            maha2 = float(err_vec @ Sigma_inv @ err_vec)
-                            nll = 0.5 * (maha2 + logdet + 2 * math.log(2 * math.pi))
+                            Sigma_reg = Sigma + np.eye(2) * 1e-6
+                            Sigma_inv = np.linalg.inv(Sigma_reg)
+                            sign, logdet = np.linalg.slogdet(Sigma_reg)
+                            if sign <= 0:
+                                nll = np.nan
+                            else:
+                                maha2 = float(err_vec @ Sigma_inv @ err_vec)
+                                nll = 0.5 * (maha2 + logdet + 2 * math.log(2 * math.pi))
                         except np.linalg.LinAlgError:
                             nll = np.nan
 
@@ -176,6 +180,8 @@ def run_evaluation(
         for h in horizons_s:
             sub = err_df[(err_df["model"] == model_name) & (err_df["horizon_s"] == h)]
             valid = sub[~sub["missed"] & sub["fde_m"].notna()]
+            if len(valid) == 0:
+                print(f"  WARNING: no valid samples for model={model_name} horizon={h}s")
             jitter = _compute_jitter(pred_df, model_name, h)
             summary_rows.append({
                 "model": model_name,
