@@ -36,6 +36,8 @@ except ImportError as exc:  # pragma: no cover - exercised only when missing.
 
 
 POINTCLOUD2_TYPE = "sensor_msgs/msg/PointCloud2"
+DEFAULT_MAX_FRAMES = 200
+DEFAULT_MAX_PLOTS = 200
 DETECTION_COLUMNS = [
     "timestamp",
     "topic",
@@ -75,7 +77,7 @@ class AxisMapping:
 class DetectionConfig:
     """Clustering and filtering parameters for the first-pass detector."""
 
-    max_frames: int = 20
+    max_frames: int = DEFAULT_MAX_FRAMES
     output_dir: Path = Path("outputs/task1")
     forward_range: tuple[float, float] = (3.0, 95.0)
     lateral_range: tuple[float, float] = (-18.0, 18.0)
@@ -89,7 +91,7 @@ class DetectionConfig:
     max_width: float = 4.8
     min_length: float = 1.2
     max_length: float = 9.0
-    max_plots: int = 20
+    max_plots: int = DEFAULT_MAX_PLOTS
     ground_band_half_height: float = 0.30
 
 
@@ -121,7 +123,8 @@ class PipelineResult:
 def run_task1_pipeline(
     bag_dir: str | Path,
     *,
-    max_frames: int = 20,
+    max_frames: int = DEFAULT_MAX_FRAMES,
+    max_plots: int = DEFAULT_MAX_PLOTS,
     output_dir: str | Path = "outputs/task1",
     topic_name: str | None = None,
     ground_filter: bool = True,
@@ -134,6 +137,7 @@ def run_task1_pipeline(
     summary = parse_bag_summary(bag_dir)
     config = DetectionConfig(
         max_frames=max_frames,
+        max_plots=max_plots,
         output_dir=output_path,
         ground_band_half_height=0.30 if ground_filter else 0.0,
     )
