@@ -36,6 +36,7 @@ except ImportError as exc:  # pragma: no cover - exercised only when missing.
 
 
 POINTCLOUD2_TYPE = "sensor_msgs/msg/PointCloud2"
+DEFAULT_MAX_FRAMES = 4800
 DETECTION_COLUMNS = [
     "timestamp",
     "topic",
@@ -75,7 +76,7 @@ class AxisMapping:
 class DetectionConfig:
     """Clustering and filtering parameters for the first-pass detector."""
 
-    max_frames: int = 20
+    max_frames: int = DEFAULT_MAX_FRAMES
     output_dir: Path = Path("outputs/task1")
     forward_range: tuple[float, float] = (3.0, 95.0)
     lateral_range: tuple[float, float] = (-18.0, 18.0)
@@ -121,7 +122,7 @@ class PipelineResult:
 def run_task1_pipeline(
     bag_dir: str | Path,
     *,
-    max_frames: int = 20,
+    max_frames: int = DEFAULT_MAX_FRAMES,
     output_dir: str | Path = "outputs/task1",
     topic_name: str | None = None,
     ground_filter: bool = True,
@@ -205,11 +206,24 @@ def run_task1_pipeline(
                 timestamp_ns=message["timestamp_ns"],
                 topic=selected_topic.name,
                 source_frame=message["source_frame"],
-                bev_points=bev_points,
+                bev_points=(
+                    bev_points
+                    if frame_index < config.max_plots
+                    else np.empty((0, 2), dtype=np.float32)
+                ),
                 detections=detections,
             )
         )
         all_detections.extend(detections)
+
+        processed = frame_index + 1
+        if processed == 1 or processed % 100 == 0 or processed == max_frames:
+            print(
+                "Task 1 progress: "
+                f"{processed}/{max_frames} frames, "
+                f"{len(all_detections)} detections",
+                flush=True,
+            )
 
     if not frames:
         diagnostics.append(
@@ -268,7 +282,8 @@ class SQLitePointCloudReader:
 
                 remaining = max_frames - yielded
                 rows = connection.execute(
-                    "select timestamp, data from messages where topic_id = ? limit ?",
+                    "select timestamp, data from messages "
+                    "where topic_id = ? order by timestamp limit ?",
                     (topic_id, remaining),
                 )
                 for timestamp_ns, raw_data in rows:
