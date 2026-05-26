@@ -94,3 +94,53 @@ uv run python scripts/run_task2.py --sensors /sensor/lidar_front/points /sensor/
 - lidar_left and lidar_right see track barriers only; they produce no vehicle detections.
 - Radar detections at >10 m lateral are barrier reflections; they fall outside the
   Mahalanobis association gate and are correctly excluded from fused output.
+
+---
+
+## Task 3: Continuous Target Tracking
+
+Adds a multi-object tracker on top of Task 2's per-frame sensor pipeline.
+Outputs persistent track IDs that survive short occlusions (coasting) and are
+never reused after deletion.
+
+Key features:
+
+- Constant-velocity EKF predict step with **ego-motion compensation** in world frame
+- Two-stage Mahalanobis-gated Hungarian assignment (confirmed→LiDAR, then confirmed→radar)
+- Track lifecycle: TENTATIVE → CONFIRMED → COASTING → DELETED
+- Barrier rejection: new seeds with `|y_ego| > 8 m` are never promoted
+- `--simulate-occlusion N` flag to demonstrate coasting recovery
+
+### Task 3 — Run
+
+```bash
+uv run python scripts/run_task3.py --bag-dir data --max-frames 60 --output-dir outputs/task3
+```
+
+Occlusion recovery demo (5-frame blank at frame 20):
+
+```bash
+uv run python scripts/run_task3.py --bag-dir data --max-frames 60 \
+    --simulate-occlusion 5 --occlusion-start 20
+```
+
+Motion model unit tests:
+
+```bash
+uv run python -m src.motion_model
+```
+
+### Task 3 — Outputs
+
+- `outputs/task3/tracks.csv` — one row per (track_id, timestamp); persistent IDs
+- `outputs/task3/tracks_summary.csv` — per-track: lifetime, path length, mean/max speed
+- `outputs/task3/tracking_bev_NNN.png` — BEV plots with trails, oriented boxes, velocity arrows
+- `outputs/task3/tracking_timeline.png` — Gantt chart: observed (solid) vs coasting (hatched)
+- `outputs/task3/task3_report.md` — motion-model derivation, gating choices, metrics, limitations
+
+### Task 3 — Notes
+
+- Ego-motion compensation uses `ego.mat` via `EgoStateLog`; falls back to zero ego velocity if absent.
+- LiDAR provides position; radar provides Doppler velocity. Cross-sensor EKF update is architecture-ready
+  but radar positions don't spatially match LiDAR vehicle clusters in this bag (barrier returns).
+- Tasks 1 and 2 are unchanged; `scripts/run_task1.py` and `scripts/run_task2.py` work as before.
