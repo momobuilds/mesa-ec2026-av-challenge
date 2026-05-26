@@ -100,10 +100,12 @@ class TrajectoryPredictor:
         P = source_P.copy()
         results: list[Prediction] = []
 
+        # Precompute which step index each horizon lands on (integer arithmetic, no float drift)
+        horizon_steps = {h: int(round(h / self._dt_sub)) - 1 for h in horizons_s}
+
         for step in range(n_steps):
             t_prev = source_ts_ns + step * dt_sub_ns
             t_now  = t_prev + dt_sub_ns
-            elapsed_s = (step + 1) * self._dt_sub
 
             ego1 = self._ego_log.interpolate(t_prev)
             ego2 = self._ego_log.interpolate(t_now)
@@ -113,9 +115,9 @@ class TrajectoryPredictor:
             else:
                 state, P = self._ctrv_step(state, P, ego1, ego2, omega, self._dt_sub)
 
-            # Check if elapsed_s is close enough to a horizon
+            # Check if this step index matches a requested horizon
             for h in horizons_s:
-                if abs(elapsed_s - h) < self._dt_sub * 0.5 + 1e-9:
+                if step == horizon_steps[h]:
                     target_ts = source_ts_ns + int(h * 1e9)
                     wx, wy = self._to_world(state, target_ts)
                     results.append(Prediction(
@@ -215,7 +217,7 @@ class TrajectoryPredictor:
         ], dtype=np.float64)
 
         F = _ctrv_jacobian(x, y, vx, vy, yaw, omega, dt, R1, R2)
-        Q = np.diag(_Q_DIAG_PER_SEC * dt)
+        Q = np.diag(_Q_DIAG_PER_SEC * dt)  # _Q_DIAG_PER_SEC holds σ² values (not σ); matches predict_state()
         P_new = F @ P @ F.T + Q
 
         return state_new, P_new
