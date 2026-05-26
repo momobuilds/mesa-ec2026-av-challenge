@@ -205,9 +205,16 @@ def render_animation(
         plt.tight_layout(pad=0.5)
 
         fig.canvas.draw()
-        buf = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-        w, h = fig.canvas.get_width_height()
-        rgb = buf.reshape(h, w, 3)
+        # tostring_rgb was removed in matplotlib 3.8; use buffer_rgba instead
+        try:
+            buf = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+            w, h = fig.canvas.get_width_height()
+            rgb = buf.reshape(h, w, 3)
+        except AttributeError:
+            buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+            w, h = fig.canvas.get_width_height()
+            rgba = buf.reshape(h, w, 4)
+            rgb = rgba[:, :, :3]
         frames_pil.append(Image.fromarray(rgb))
         plt.close(fig)
 
