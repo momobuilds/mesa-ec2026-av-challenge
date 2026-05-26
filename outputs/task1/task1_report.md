@@ -50,8 +50,8 @@ Topics:
 
 ## Outputs
 
-- CSV: `outputs\task1\detections.csv`
-- BEV plots: `outputs\task1\frame_*.png`
+- CSV: `outputs/task1/detections.csv`
+- BEV plots: `outputs/task1/frame_*.png`
 
 ## Current Limitations
 
