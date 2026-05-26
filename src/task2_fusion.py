@@ -302,6 +302,41 @@ def _to_sensor_detections(
     return by_ts
 
 
+def build_detection_index(
+    all_frames: dict[str, list[FrameResult]],
+    *,
+    oriented_boxes: dict | None = None,
+    doppler_vel: dict | None = None,
+) -> tuple[list[SensorDetection], np.ndarray]:
+    """Convert all FrameResult lists into a flat sorted list of SensorDetections.
+
+    Returns
+    -------
+    all_dets : sorted by timestamp_ns
+    ts_arr   : int64 numpy array of timestamps (same order) for searchsorted
+    """
+    all_dets: list[SensorDetection] = []
+    for topic, frames in all_frames.items():
+        by_ts = _to_sensor_detections(frames, oriented_boxes=oriented_boxes, doppler_vel=doppler_vel)
+        for dets in by_ts.values():
+            all_dets.extend(dets)
+    all_dets.sort(key=lambda d: d.timestamp_ns)
+    ts_arr = np.array([d.timestamp_ns for d in all_dets], dtype=np.int64)
+    return all_dets, ts_arr
+
+
+def gather_detections(
+    all_dets: list[SensorDetection],
+    ts_arr: np.ndarray,
+    timestamp_ns: int,
+    window_ns: int = ASSOC_WINDOW_NS,
+) -> list[SensorDetection]:
+    """Return all detections within ±window_ns of timestamp_ns."""
+    lo, hi = timestamp_ns - window_ns, timestamp_ns + window_ns
+    idx = np.searchsorted(ts_arr, [lo, hi])
+    return all_dets[idx[0]: idx[1]]
+
+
 def run_fusion(
     all_frames: dict[str, list[FrameResult]],
     *,
