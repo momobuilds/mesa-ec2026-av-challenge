@@ -182,3 +182,38 @@ Skip animation for speed: `--no-animation`
 - Default grid: ±300 m, 0.25 m/cell → 2 400² cells (22 MB). Use `--grid-extent 700` for full-bag.
 - Dynamic-object masking requires `outputs/task3/tracks.csv` from Task 3. Skip with `--no-mask-tracks`.
 - Full-bag trajectory spans 671 m × 1 122 m; the 60-frame run covers ~240 m of the circuit.
+
+---
+
+## Task 5: Trajectory Prediction (Bonus)
+
+Predicts future opponent trajectories from Task 3 confirmed tracks at
+horizons of 0.5, 1.0, and 2.0 s. Two motion models — Constant Velocity (CV)
+and Constant Turn Rate + Velocity (CTRV) — with full covariance propagation
+and a self-evaluation harness that computes FDE, lateral/longitudinal error,
+and NLL against actual future track positions.
+
+### Task 5 — Run
+
+```bash
+uv run python scripts/run_task5.py \
+    --tracks outputs/task3/tracks.csv \
+    --bag-dir data \
+    --output-dir outputs/task5
+```
+
+Skip ground-truth evaluation (useful for tracks without future frames):
+
+```bash
+uv run python scripts/run_task5.py --tracks outputs/task3/tracks.csv --bag-dir data --no-eval
+```
+
+### Task 5 — Outputs
+
+- `outputs/task5/predictions.csv` — every `(source_ts, track_id, horizon, model)` prediction
+- `outputs/task5/prediction_errors.csv` — per-prediction FDE, lateral, longitudinal, NLL
+- `outputs/task5/prediction_summary.csv` — aggregated mean/median/p95 per (model, horizon)
+- `outputs/task5/prediction_bev_NNN.png` — BEV frames with fading trajectories + uncertainty ellipses
+- `outputs/task5/prediction_error_hist.png` — FDE histograms CV vs CTRV per horizon
+- `outputs/task5/manoeuvre_case_study.png` — zoom on most curved track
+- `outputs/task5/task5_report.md` — methodology, math, comparison table, limitations
