@@ -74,6 +74,12 @@ Extends Task 1 across all 7 PointCloud2 sensors (3 LiDARs + 4 radars) with:
 uv run python scripts/run_task2.py --bag-dir data --max-frames 20 --output-dir outputs/task2
 ```
 
+Validate the generated artifacts without requiring `pytest`:
+
+```bash
+uv run python scripts/validate_task2_outputs.py --output-dir outputs/task2
+```
+
 To inspect the bag without running detection:
 
 ```bash
@@ -90,6 +96,8 @@ uv run python scripts/run_task2.py --sensors /sensor/lidar_front/points /sensor/
 
 - `outputs/task2/fused_detections.csv` — one row per fused detection per master timestamp
 - `outputs/task2/fusion_bev_NNN.png` — BEV plots (raw points + oriented boxes + velocity arrows)
+- `outputs/task2/verify_lidar_overlay_000.png` — regenerated LiDAR ego-frame alignment check
+- `outputs/task2/verify_camera_projection_000.png` — regenerated camera projection-gating check
 - `outputs/task2/task2_report.md` — full assumptions, limitations, and results
 
 ### Task 2 — Notes
@@ -98,6 +106,10 @@ uv run python scripts/run_task2.py --sensors /sensor/lidar_front/points /sensor/
 - lidar_left and lidar_right see track barriers only; they produce no vehicle detections.
 - Radar detections at >10 m lateral are barrier reflections; they fall outside the
   Mahalanobis association gate and are correctly excluded from fused output.
+- Camera contribution is projection-gating validation because no camera object
+  detector or `camera_info` topics are available in the bag.
+- Velocity uses matched radar Doppler when available, otherwise a short temporal
+  filter estimates ego-frame relative velocity from associated detections.
 
 ---
 

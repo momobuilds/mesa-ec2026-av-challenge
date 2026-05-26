@@ -30,6 +30,12 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import linear_sum_assignment
 
+from src.camera_projection import (
+    IMAGE_HEIGHT,
+    IMAGE_WIDTH,
+    bbox_3d_corners,
+    project_points,
+)
 from src.task1_detection import FrameResult
 
 # ── State vector indices ──────────────────────────────────────────────────────
@@ -55,6 +61,9 @@ FUSED_COLUMNS = [
     "cov_xx", "cov_yy", "cov_vxvx", "cov_vyvy",
     "confidence", "sensors",
     "n_lidar", "n_radar",
+    "n_camera", "camera_topic", "camera_visible", "camera_validated",
+    "camera_time_delta_ms", "track_id", "age", "missed_frames",
+    "is_predicted", "velocity_source",
 ]
 
 
@@ -97,6 +106,28 @@ class SensorDetection:
 
     def full_R(self) -> np.ndarray:
         return _R_RADAR.copy() if self.is_radar else _R_LIDAR.copy()
+
+
+@dataclass
+class _FusionTrack:
+    """Short-lived Task 2 track used for velocity and missing-data robustness."""
+
+    track_id: int
+    x: float
+    y: float
+    vx: float
+    vy: float
+    yaw: float
+    length: float
+    width: float
+    confidence: float
+    last_ts: int
+    age: int = 1
+    missed_frames: int = 0
+
+    def predicted_xy(self, timestamp_ns: int) -> tuple[float, float]:
+        dt = max((timestamp_ns - self.last_ts) / 1_000_000_000.0, 0.0)
+        return self.x + self.vx * dt, self.y + self.vy * dt
 
 
 # ── EKF update (single step, constant-velocity model) ────────────────────────
@@ -244,6 +275,19 @@ def fuse_frame(
             ))),
             "n_lidar": n_lidar,
             "n_radar": n_radar,
+            "n_camera": 0,
+            "camera_topic": "",
+            "camera_visible": False,
+            "camera_validated": False,
+            "camera_time_delta_ms": "",
+            "track_id": -1,
+            "age": 1,
+            "missed_frames": 0,
+            "is_predicted": False,
+            "velocity_source": (
+                "radar" if n_radar > 0 and math.hypot(state[_VX], state[_VY]) > 0.1
+                else "none"
+            ),
         })
 
     return results
@@ -344,6 +388,7 @@ def run_fusion(
     window_ns: int = ASSOC_WINDOW_NS,
     oriented_boxes: dict | None = None,
     doppler_vel: dict | None = None,
+    camera_index: dict[str, Any] | None = None,
 ) -> pd.DataFrame:
     """Run the full fusion pipeline and return a fused-detections DataFrame.
 
@@ -354,6 +399,8 @@ def run_fusion(
     window_ns : ±ns window for gathering other-sensor detections.
     oriented_boxes : optional {topic: {frame_idx: {det_id: obb_dict}}}.
     doppler_vel : optional {topic: {frame_idx: [(vx, vy), ...]}}.
+    camera_index : optional {"topic": str, "timestamps_ns": np.ndarray} used
+        for projection-gating camera validation.
     """
     if master_topic not in all_frames:
         raise ValueError(
@@ -395,7 +442,324 @@ def run_fusion(
 
     if not all_fused:
         return pd.DataFrame(columns=FUSED_COLUMNS)
-    return pd.DataFrame(all_fused, columns=FUSED_COLUMNS)
+
+    tracked = _apply_temporal_filter(
+        all_fused,
+        camera_index=camera_index,
+        window_ns=window_ns,
+        master_topic=master_topic,
+    )
+    return pd.DataFrame(tracked, columns=FUSED_COLUMNS)
+
+
+def _apply_temporal_filter(
+    rows: list[dict[str, Any]],
+    *,
+    camera_index: dict[str, Any] | None,
+    window_ns: int,
+    master_topic: str,
+) -> list[dict[str, Any]]:
+    """Attach short track IDs and fill velocity from temporal differences.
+
+    Radar Doppler remains the preferred velocity source when a radar detection
+    actually associated with the LiDAR anchor. When it did not, this lightweight
+    tracker estimates ego-frame relative velocity from frame-to-frame motion and
+    emits short-horizon predictions for brief missed detections.
+    """
+
+    by_ts: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        by_ts.setdefault(int(row["timestamp_ns"]), []).append(dict(row))
+
+    tracks: dict[int, _FusionTrack] = {}
+    next_track_id = 1
+    output: list[dict[str, Any]] = []
+    max_missed = 2
+    association_gate_m = 10.0
+
+    for timestamp_ns in sorted(by_ts):
+        detections = by_ts[timestamp_ns]
+        track_ids = [
+            tid for tid, trk in tracks.items()
+            if trk.missed_frames <= max_missed
+        ]
+
+        matches: list[tuple[int, int]] = []
+        unmatched_tracks = set(track_ids)
+        unmatched_detections = set(range(len(detections)))
+
+        if track_ids and detections:
+            cost = np.full((len(track_ids), len(detections)), 1e6, dtype=np.float64)
+            for i, track_id in enumerate(track_ids):
+                pred_x, pred_y = tracks[track_id].predicted_xy(timestamp_ns)
+                for j, det in enumerate(detections):
+                    dx = float(det["center_x"]) - pred_x
+                    dy = float(det["center_y"]) - pred_y
+                    cost[i, j] = math.hypot(dx, dy)
+
+            rows_idx, cols_idx = linear_sum_assignment(cost)
+            for r, c in zip(rows_idx, cols_idx):
+                if cost[r, c] <= association_gate_m:
+                    track_id = track_ids[int(r)]
+                    det_idx = int(c)
+                    matches.append((track_id, det_idx))
+                    unmatched_tracks.discard(track_id)
+                    unmatched_detections.discard(det_idx)
+
+        for track_id, det_idx in matches:
+            track = tracks[track_id]
+            row = _update_track_with_detection(track, detections[det_idx])
+            _annotate_camera(row, camera_index, window_ns)
+            output.append(row)
+
+        for det_idx in sorted(unmatched_detections):
+            row = detections[det_idx]
+            radar_speed = math.hypot(float(row["vx"]), float(row["vy"]))
+            velocity_source = (
+                "radar"
+                if int(row.get("n_radar", 0)) > 0 and radar_speed > 0.1
+                else "initialized"
+            )
+            if radar_speed > 1.0:
+                row["yaw"] = math.atan2(float(row["vy"]), float(row["vx"]))
+
+            track = _FusionTrack(
+                track_id=next_track_id,
+                x=float(row["center_x"]),
+                y=float(row["center_y"]),
+                vx=float(row["vx"]),
+                vy=float(row["vy"]),
+                yaw=float(row["yaw"]),
+                length=float(row["length"]),
+                width=float(row["width"]),
+                confidence=float(row["confidence"]),
+                last_ts=timestamp_ns,
+            )
+            tracks[next_track_id] = track
+
+            row.update({
+                "track_id": next_track_id,
+                "age": track.age,
+                "missed_frames": track.missed_frames,
+                "is_predicted": False,
+                "velocity_source": velocity_source,
+            })
+            _annotate_camera(row, camera_index, window_ns)
+            output.append(row)
+            next_track_id += 1
+
+        for track_id in sorted(unmatched_tracks):
+            track = tracks[track_id]
+            track.missed_frames += 1
+            if track.age < 2 or track.missed_frames > max_missed:
+                continue
+            row = _predicted_track_row(
+                track,
+                timestamp_ns=timestamp_ns,
+                master_topic=master_topic,
+            )
+            _annotate_camera(row, camera_index, window_ns)
+            output.append(row)
+
+        tracks = {
+            tid: trk for tid, trk in tracks.items()
+            if trk.missed_frames <= max_missed
+        }
+
+    output.sort(key=lambda item: (int(item["timestamp_ns"]), int(item["track_id"])))
+    return output
+
+
+def _update_track_with_detection(
+    track: _FusionTrack,
+    row: dict[str, Any],
+) -> dict[str, Any]:
+    timestamp_ns = int(row["timestamp_ns"])
+    dt = max((timestamp_ns - track.last_ts) / 1_000_000_000.0, 1e-3)
+    det_x = float(row["center_x"])
+    det_y = float(row["center_y"])
+    pred_x, pred_y = track.predicted_xy(timestamp_ns)
+
+    temporal_vx, temporal_vy = _limit_velocity_pair(
+        (det_x - track.x) / dt,
+        (det_y - track.y) / dt,
+    )
+    radar_speed = math.hypot(float(row["vx"]), float(row["vy"]))
+
+    if int(row.get("n_radar", 0)) > 0 and radar_speed > 0.1:
+        measured_vx = float(row["vx"])
+        measured_vy = float(row["vy"])
+        velocity_source = "radar"
+    else:
+        measured_vx = temporal_vx
+        measured_vy = temporal_vy
+        velocity_source = "temporal"
+
+    velocity_alpha = 0.65 if track.age > 1 else 0.85
+    vx, vy = _limit_velocity_pair(
+        velocity_alpha * measured_vx + (1.0 - velocity_alpha) * track.vx,
+        velocity_alpha * measured_vy + (1.0 - velocity_alpha) * track.vy,
+    )
+    speed = math.hypot(vx, vy)
+    yaw = math.atan2(vy, vx) if speed > 1.0 else float(row["yaw"])
+
+    smoothed_x = 0.85 * det_x + 0.15 * pred_x
+    smoothed_y = 0.85 * det_y + 0.15 * pred_y
+
+    track.x = smoothed_x
+    track.y = smoothed_y
+    track.vx = vx
+    track.vy = vy
+    track.yaw = yaw
+    track.length = float(row["length"])
+    track.width = float(row["width"])
+    track.confidence = float(row["confidence"])
+    track.last_ts = timestamp_ns
+    track.age += 1
+    track.missed_frames = 0
+
+    row.update({
+        "center_x": smoothed_x,
+        "center_y": smoothed_y,
+        "vx": vx,
+        "vy": vy,
+        "yaw": yaw,
+        "cov_vxvx": min(float(row["cov_vxvx"]), 4.0 if velocity_source == "temporal" else float(row["cov_vxvx"])),
+        "cov_vyvy": min(float(row["cov_vyvy"]), 4.0 if velocity_source == "temporal" else float(row["cov_vyvy"])),
+        "confidence": float(np.clip(float(row["confidence"]) + min(track.age, 5) * 0.01, 0.0, 1.0)),
+        "track_id": track.track_id,
+        "age": track.age,
+        "missed_frames": 0,
+        "is_predicted": False,
+        "velocity_source": velocity_source,
+    })
+    return row
+
+
+def _predicted_track_row(
+    track: _FusionTrack,
+    *,
+    timestamp_ns: int,
+    master_topic: str,
+) -> dict[str, Any]:
+    pred_x, pred_y = track.predicted_xy(timestamp_ns)
+    speed = math.hypot(track.vx, track.vy)
+    yaw = math.atan2(track.vy, track.vx) if speed > 1.0 else track.yaw
+    return {
+        "timestamp_ns": timestamp_ns,
+        "master_topic": master_topic,
+        "detection_id": f"{timestamp_ns}_track{track.track_id:03d}_pred",
+        "center_x": pred_x,
+        "center_y": pred_y,
+        "vx": track.vx,
+        "vy": track.vy,
+        "yaw": yaw,
+        "length": track.length,
+        "width": track.width,
+        "cov_xx": 2.0 + track.missed_frames,
+        "cov_yy": 2.0 + track.missed_frames,
+        "cov_vxvx": 6.0 + track.missed_frames,
+        "cov_vyvy": 6.0 + track.missed_frames,
+        "confidence": float(np.clip(track.confidence * (0.7 ** track.missed_frames), 0.0, 1.0)),
+        "sensors": "temporal_prediction",
+        "n_lidar": 0,
+        "n_radar": 0,
+        "n_camera": 0,
+        "camera_topic": "",
+        "camera_visible": False,
+        "camera_validated": False,
+        "camera_time_delta_ms": "",
+        "track_id": track.track_id,
+        "age": track.age,
+        "missed_frames": track.missed_frames,
+        "is_predicted": True,
+        "velocity_source": "prediction",
+    }
+
+
+def _annotate_camera(
+    row: dict[str, Any],
+    camera_index: dict[str, Any] | None,
+    window_ns: int,
+) -> None:
+    visible = _candidate_camera_visible(row)
+    synced = False
+    topic = ""
+    delta_ms: float | str = ""
+    if camera_index:
+        topic = str(camera_index.get("topic", ""))
+        timestamps = np.asarray(camera_index.get("timestamps_ns", []), dtype=np.int64)
+        if len(timestamps):
+            ts = int(row["timestamp_ns"])
+            idx = int(np.searchsorted(timestamps, ts))
+            candidates = []
+            if idx < len(timestamps):
+                candidates.append(int(timestamps[idx]))
+            if idx > 0:
+                candidates.append(int(timestamps[idx - 1]))
+            if candidates:
+                nearest = min(candidates, key=lambda item: abs(item - ts))
+                delta_ns = abs(nearest - ts)
+                synced = delta_ns <= window_ns
+                if synced:
+                    delta_ms = round(delta_ns / 1_000_000.0, 3)
+
+    validated = bool(visible and synced)
+    row["camera_visible"] = bool(visible)
+    row["camera_validated"] = validated
+    row["camera_topic"] = topic if synced else ""
+    row["camera_time_delta_ms"] = delta_ms
+    row["n_camera"] = 1 if validated else 0
+
+    if validated:
+        sensors = {
+            item for item in str(row.get("sensors", "")).split("+")
+            if item
+        }
+        sensors.add(_sensor_label(topic))
+        row["sensors"] = "+".join(sorted(sensors))
+        row["confidence"] = float(np.clip(float(row["confidence"]) + 0.05, 0.0, 1.0))
+
+
+def _candidate_camera_visible(row: dict[str, Any]) -> bool:
+    cx = float(row["center_x"])
+    cy = float(row["center_y"])
+    yaw = float(row["yaw"])
+    length = max(float(row["length"]), 0.1)
+    width = max(float(row["width"]), 0.1)
+    corners = bbox_3d_corners(cx, cy, 0.0, length, width, 1.5, yaw)
+    points = np.vstack((corners, np.array([[cx, cy, 0.0]], dtype=np.float64)))
+    uv, in_front = project_points(points)
+    if not in_front.any():
+        return False
+    in_image = (
+        in_front
+        & (uv[:, 0] >= 0.0)
+        & (uv[:, 0] < IMAGE_WIDTH)
+        & (uv[:, 1] >= 0.0)
+        & (uv[:, 1] < IMAGE_HEIGHT)
+    )
+    return bool(in_image.any())
+
+
+def _sensor_label(topic: str) -> str:
+    parts = [part for part in topic.split("/") if part]
+    if len(parts) >= 3 and parts[0] == "sensor":
+        return parts[1]
+    return topic.replace("/", "_").strip("_") or "camera"
+
+
+def _limit_velocity_pair(
+    vx: float,
+    vy: float,
+    *,
+    max_speed: float = 60.0,
+) -> tuple[float, float]:
+    speed = math.hypot(vx, vy)
+    if speed <= max_speed or speed <= 1e-9:
+        return float(vx), float(vy)
+    scale = max_speed / speed
+    return float(vx * scale), float(vy * scale)
 
 
 # ── BEV plot ─────────────────────────────────────────────────────────────────
