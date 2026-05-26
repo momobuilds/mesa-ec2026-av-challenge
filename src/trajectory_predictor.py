@@ -30,7 +30,7 @@ import numpy as np
 import pandas as pd
 
 from src.ego_trajectory import EgoTrajectory
-from src.motion_model import predict_state, _rot2d
+from src.motion_model import predict_state, _rot2d, _Q_DIAG_PER_SEC
 from src.task2_fusion import _X, _Y, _VX, _VY, _YAW, _L, _W, STATE_DIM
 from src.tf_utils import EgoStateLog
 
@@ -215,7 +215,6 @@ class TrajectoryPredictor:
         ], dtype=np.float64)
 
         F = _ctrv_jacobian(x, y, vx, vy, yaw, omega, dt, R1, R2)
-        from src.motion_model import _Q_DIAG_PER_SEC
         Q = np.diag(_Q_DIAG_PER_SEC * dt)
         P_new = F @ P @ F.T + Q
 
