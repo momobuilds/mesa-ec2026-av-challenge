@@ -44,6 +44,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Only print bag metadata summary and exit.",
     )
+    parser.add_argument(
+        "--no-ground-filter",
+        action="store_true",
+        help="Disable ground-plane filtering (useful for debugging raw point cloud layout).",
+    )
     return parser.parse_args()
 
 
@@ -60,6 +65,7 @@ def main() -> None:
         max_frames=args.max_frames,
         output_dir=args.output_dir,
         topic_name=args.topic,
+        ground_filter=not args.no_ground_filter,
     )
 
     print("")

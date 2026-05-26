@@ -84,6 +84,7 @@ class DetectionConfig:
     min_length: float = 1.2
     max_length: float = 9.0
     max_plots: int = 20
+    ground_band_half_height: float = 0.30
 
 
 @dataclass
@@ -117,6 +118,7 @@ def run_task1_pipeline(
     max_frames: int = 20,
     output_dir: str | Path = "outputs/task1",
     topic_name: str | None = None,
+    ground_filter: bool = True,
 ) -> PipelineResult:
     """Run metadata inspection, point-cloud detection, CSV export, and plots."""
 
@@ -124,7 +126,11 @@ def run_task1_pipeline(
     output_path.mkdir(parents=True, exist_ok=True)
 
     summary = parse_bag_summary(bag_dir)
-    config = DetectionConfig(max_frames=max_frames, output_dir=output_path)
+    config = DetectionConfig(
+        max_frames=max_frames,
+        output_dir=output_path,
+        ground_band_half_height=0.30 if ground_filter else 0.0,
+    )
     diagnostics: list[str] = []
 
     selected_topic = _resolve_topic(summary, topic_name, diagnostics)
@@ -173,14 +179,18 @@ def run_task1_pipeline(
                 f"vertical={axis_mapping.vertical or 'none'} ({axis_mapping.reason})"
             )
 
-        bev_points = extract_bev_points(structured_points, axis_mapping, config)
-        detections = detect_vehicle_candidates(
+        bev_points = extract_bev_points(
+            structured_points, axis_mapping, config, frame_index=frame_index
+        )
+        sensor_kind = "radar" if "radar" in selected_topic.name.lower() else "lidar"
+        detections = detect_opponents_in_frame(
             bev_points,
+            sensor_kind=sensor_kind,
+            config=config,
             timestamp_ns=message["timestamp_ns"],
             topic=selected_topic.name,
             source_frame=message["source_frame"],
             frame_index=frame_index,
-            config=config,
         )
 
         frames.append(
@@ -380,6 +390,8 @@ def extract_bev_points(
     structured_points: np.ndarray,
     axis_mapping: AxisMapping,
     config: DetectionConfig,
+    *,
+    frame_index: int = -1,
 ) -> np.ndarray:
     """Return cropped BEV points as ``[forward_m, lateral_m]``."""
 
@@ -391,6 +403,7 @@ def extract_bev_points(
     mask &= lateral >= config.lateral_range[0]
     mask &= lateral <= config.lateral_range[1]
 
+    vertical: np.ndarray | None = None
     if axis_mapping.vertical and axis_mapping.vertical in structured_points.dtype.names:
         vertical = structured_points[axis_mapping.vertical].astype(np.float64, copy=False)
         mask &= np.isfinite(vertical)
@@ -402,24 +415,40 @@ def extract_bev_points(
             mask &= vertical >= low
             mask &= vertical <= high
 
+    if vertical is not None and config.ground_band_half_height > 0:
+        total = int(mask.sum())
+        close_mask = mask & (forward >= 5.0) & (forward <= 25.0)
+        close_vertical = vertical[close_mask]
+        if len(close_vertical) > 10:
+            ground_median = float(np.median(close_vertical))
+            mask &= np.abs(vertical - ground_median) > config.ground_band_half_height
+        kept = int(mask.sum())
+        print(f"frame {frame_index}: kept {kept}/{total} points after ground filter")
+
     return np.column_stack((forward[mask], lateral[mask])).astype(np.float32, copy=False)
 
 
-def detect_vehicle_candidates(
+def detect_opponents_in_frame(
     bev_points: np.ndarray,
     *,
+    sensor_kind: str,
+    config: DetectionConfig,
     timestamp_ns: int,
     topic: str,
     source_frame: str,
     frame_index: int,
-    config: DetectionConfig,
 ) -> list[dict[str, Any]]:
-    """Cluster BEV points and filter clusters by plausible vehicle dimensions."""
+    """Cluster BEV points and filter clusters by plausible vehicle dimensions.
+
+    Args:
+        bev_points: shape (N, 2), columns = [forward_m, lateral_m]
+        sensor_kind: ``"lidar"`` or ``"radar"`` — selects DBSCAN presets
+    """
 
     if len(bev_points) == 0:
         return []
 
-    is_radar = "radar" in topic.lower()
+    is_radar = sensor_kind == "radar"
     eps = config.dbscan_eps_radar if is_radar else config.dbscan_eps_lidar
     min_samples = (
         config.dbscan_min_samples_radar if is_radar else config.dbscan_min_samples_lidar
@@ -482,6 +511,32 @@ def detect_vehicle_candidates(
         detection_id += 1
 
     return detections
+
+
+def detect_vehicle_candidates(
+    bev_points: np.ndarray,
+    *,
+    timestamp_ns: int,
+    topic: str,
+    source_frame: str,
+    frame_index: int,
+    config: DetectionConfig,
+) -> list[dict[str, Any]]:
+    """Cluster BEV points and filter clusters by plausible vehicle dimensions.
+
+    Thin wrapper around :func:`detect_opponents_in_frame` that infers
+    ``sensor_kind`` from the topic name for backward compatibility.
+    """
+    sensor_kind = "radar" if "radar" in topic.lower() else "lidar"
+    return detect_opponents_in_frame(
+        bev_points,
+        sensor_kind=sensor_kind,
+        config=config,
+        timestamp_ns=timestamp_ns,
+        topic=topic,
+        source_frame=source_frame,
+        frame_index=frame_index,
+    )
 
 
 def _resolve_topic(
@@ -576,8 +631,8 @@ def _build_report(result: PipelineResult) -> str:
             "",
             "## Outputs",
             "",
-            f"- CSV: `{result.output_dir / 'detections.csv'}`",
-            f"- BEV plots: `{result.output_dir / 'frame_*.png'}`",
+            f"- CSV: `{(result.output_dir / 'detections.csv').as_posix()}`",
+            f"- BEV plots: `{(result.output_dir / 'frame_*.png').as_posix()}`",
             "",
             "## Current Limitations",
             "",
