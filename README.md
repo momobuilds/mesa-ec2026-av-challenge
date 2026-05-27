@@ -416,3 +416,52 @@ uv run --with pytest python -m pytest -q
 
 At the time Task 7 was added, the full suite had one unrelated Task 2 camera
 validation assertion failure in `tests/test_task2_fusion.py`; Task 7 tests pass.
+
+---
+
+## Demo Video: Tasks 1 to 7
+
+The demo video pipeline composites the existing Task 1-7 PNG/CSV outputs into
+a recorded MP4 without rerunning or rewriting the core algorithms. It adds
+timestamps, task labels, detection/fusion/tracking summaries, behaviour labels,
+predicted opponent trajectories, and the selected Task 7 overtake plan.
+
+Default run:
+
+```bash
+uv run python demo/generate_demo_video.py
+```
+
+Equivalent explicit run:
+
+```bash
+uv run python demo/generate_demo_video.py \
+    --outputs-dir outputs \
+    --bag data \
+    --output demo/demo_task1_to_7.mp4
+```
+
+Optional raw camera panel from the ROS bag:
+
+```bash
+uv run python demo/generate_demo_video.py \
+    --raw-source bag \
+    --bag data \
+    --camera-topic /sensor/camera/camera_fl/image/compressed
+```
+
+Useful controls:
+
+```bash
+uv run python demo/generate_demo_video.py --frames 80 --fps 8
+uv run python demo/generate_demo_video.py --width 1280 --height 720
+uv run python demo/generate_demo_video.py --output demo/custom_demo.mp4
+```
+
+Expected output:
+
+- `demo/demo_task1_to_7.mp4`
+
+The script is robust to missing artifacts: if a camera stream, CSV, rendered
+task image, or planner output is unavailable, the affected panel shows a clear
+placeholder or warning while the rest of the demo continues to render.
