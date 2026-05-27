@@ -1,7 +1,7 @@
 [project]
 name = "mesa-ec2026-av-challenge"
 version = "0.1.0"
-description = "Add your description here"
+description = "Polimi/MESA EC2026 autonomous vehicle challenge pipeline for detection, fusion, tracking, mapping, prediction, behaviour prediction, and overtake planning."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -22,6 +22,11 @@ dependencies = [
     "scipy>=1.17.1",
     "shapely>=2.1.2",
     "tqdm>=4.67.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
 ]
 
 [tool.pytest.ini_options]

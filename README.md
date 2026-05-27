@@ -267,3 +267,152 @@ uv run python scripts/run_task5.py --tracks outputs/task3/tracks.csv --bag-dir d
 - `outputs/task5/prediction_error_hist.png` — FDE histograms CV vs CTRV per horizon
 - `outputs/task5/manoeuvre_case_study.png` — zoom on most curved track
 - `outputs/task5/task5_report.md` — methodology, math, comparison table, limitations
+
+---
+
+## Task 6: Behaviour Prediction
+
+Classifies tracked opponent behaviour using Task 3 track histories, Task 4
+boundary context, and Task 5 prediction evidence. The classifier is
+rule-based and explainable because no labelled behaviour dataset is provided.
+It assigns `lane_keeping`, `braking`, `overtaking_attempt`,
+`trajectory_recovery`, or `unknown`, with confidence scores and per-frame
+explanations.
+
+### Task 6 — Run
+
+```bash
+uv run python src/task6_behavior_prediction.py \
+    --tracks outputs/task3/tracks.csv \
+    --predictions outputs/task5/predictions.csv \
+    --prediction-errors outputs/task5/prediction_errors.csv \
+    --map-dir outputs/task4 \
+    --output-dir outputs/task6
+```
+
+### Task 6 — Outputs
+
+- `outputs/task6/behaviour_predictions.csv` — per-frame behaviour labels, scores, confidence, and explanation
+- `outputs/task6/track_behaviour_segments.csv` — consecutive same-behaviour intervals per track
+- `outputs/task6/behaviour_summary.csv` — class counts, percentages, confidence, and input notes
+- `outputs/task6/behaviour_timeline.png` — behaviour labels over time by track
+- `outputs/task6/behaviour_bev.png` — BEV behaviour visualization
+- `outputs/task6/track_*_behaviour_signals.png` — signal plots for interesting tracks
+- `outputs/task6/README.md` — method report and limitations
+
+### Task 6 — Notes
+
+- Temporal hysteresis reduces frame-to-frame label flicker.
+- Task 5 prediction disagreement contributes evidence for manoeuvre-like behaviour.
+- Unknown and low-confidence tracks are intentionally conservative so Task 7 can use larger safety margins.
+
+---
+
+## Task 7: Overtake Strategy / Planning
+
+Implements a hybrid overtake planner for collision avoidance, evasive
+trajectories, racing-line adaptation, and explainable strategy selection. The
+core planner is deterministic and safety-constrained; it samples short-horizon
+candidate manoeuvres and rejects unsafe options with hard constraints. A
+lightweight learned risk model then ranks safe candidates using pseudo-labels
+generated from deterministic risk metrics.
+
+Candidate strategies include:
+
+- `keep_racing_line`
+- `follow_opponent`
+- `brake`
+- `evasive_left`
+- `evasive_right`
+- `overtake_left`
+- `overtake_right`
+- `abort_overtake`
+- `emergency_brake`
+
+The innovation layer uses a `RandomForestRegressor` when scikit-learn is
+available. It does not replace the safety planner: unsafe candidates are never
+selected because of a learned score.
+
+### Task 7 — Run
+
+Default run:
+
+```bash
+uv run python src/task7_overtake_planning.py
+```
+
+Explicit run:
+
+```bash
+uv run python src/task7_overtake_planning.py \
+    --tracks outputs/task3/tracks.csv \
+    --predictions outputs/task5/predictions.csv \
+    --behaviour outputs/task6/behaviour_predictions.csv \
+    --map-dir outputs/task4 \
+    --output-dir outputs/task7
+```
+
+Disable the learned ranking layer for a deterministic-only comparison:
+
+```bash
+uv run python src/task7_overtake_planning.py --no-learning
+```
+
+### Task 7 — Outputs
+
+- `outputs/task7/planning_decisions.csv` — selected strategy, confidence, safety margin, risk scores, and explanation per frame
+- `outputs/task7/planned_trajectories.csv` — sampled candidate and selected ego trajectories over the planning horizon
+- `outputs/task7/risk_assessment.csv` — deterministic and learned risk metrics for every candidate
+- `outputs/task7/planning_summary.csv` — frame counts, strategy distribution, safety margins, and input notes
+- `outputs/task7/strategy_timeline.png` — selected strategy over time
+- `outputs/task7/planning_bev.png` — BEV plot of selected plans, opponent tracks, and corridor context
+- `outputs/task7/overtake_scenarios.png` — representative following, evasive, overtake, abort, and emergency scenarios
+- `outputs/task7/README.md` — planner method report
+- `outputs/task7/learned_risk_training_data.csv` — pseudo-labelled candidate table
+- `outputs/task7/learned_risk_scores.csv` — learned risk scores and final costs
+- `outputs/task7/learning_model_summary.csv` — model type, feature count, scores, fallback reason, and top features
+- `outputs/task7/learning_feature_importance.png` — feature importance plot when supported
+
+### Task 7 — Latest Generated Summary
+
+The current generated `outputs/task7` run used Task 3-6 outputs plus
+`data/ego.mat` and loaded 197 planning frames:
+
+- 1,773 candidate risk assessments
+- 21 selected overtake attempts
+- 4 aborted overtakes
+- 31 emergency-brake selections
+- Mean selected safety margin: 4.15 m
+- Minimum selected safety margin: -4.91 m in emergency/fallback cases
+- Learned model: `RandomForestRegressor`
+- Learning validation score: 0.987
+- Top learned risk feature: `collision_risk_score`
+
+### Task 7 — Notes
+
+- Task 3 and Task 5 outputs are ego-frame, while Task 4 boundaries are world-frame. The planner therefore uses an inferred local racing corridor for hard constraints and uses Task 4 GeoJSON boundaries as visual/context evidence.
+- Behaviour labels from Task 6 adjust margins: `unknown` and `trajectory_recovery` block overtaking, while `lane_keeping` and clear side clearance can unlock overtake candidates.
+- A clean-overtake bonus rewards safe side passes only after hard safety checks are satisfied.
+- If Task 5 predictions are missing, Task 7 falls back to constant-velocity predictions from Task 3 tracks.
+- If scikit-learn is unavailable or the pseudo-labelled table is too small, Task 7 writes the learning files and runs deterministic scoring only.
+
+---
+
+## Verification
+
+Task 7 focused tests:
+
+```bash
+uv run --with pytest python -m pytest tests/test_task7_overtake_planning.py -q
+```
+
+Current result: `6 passed`.
+
+Full test suite:
+
+```bash
+uv run --with pytest python -m pytest -q
+```
+
+At the time Task 7 was added, the full suite had one unrelated Task 2 camera
+validation assertion failure in `tests/test_task2_fusion.py`; Task 7 tests pass.
