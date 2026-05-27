@@ -609,7 +609,17 @@ def _update_track_with_detection(
         alpha * measured_vy + (1.0 - alpha) * track.vy,
     )
     speed = math.hypot(vx, vy)
-    yaw = math.atan2(vy, vx) if speed > 1.0 else float(row["yaw"])
+
+    # Heading: prefer velocity direction when moving, else use OBB yaw.
+    # Apply EMA smoothing to suppress frame-to-frame OBB flips.
+    if speed > 1.0:
+        raw_yaw = math.atan2(vy, vx)
+    else:
+        raw_yaw = float(row["yaw"])
+    # Smooth: interpolate the angular difference to avoid ±π wrap issues
+    yaw_diff = _wrap_angle_diff(raw_yaw - track.yaw)
+    yaw_alpha = 0.55 if track.age > 2 else 0.90  # trust history more for established tracks
+    yaw = _wrap_angle_pi(track.yaw + yaw_alpha * yaw_diff)
 
     smoothed_x = 0.85 * det_x + 0.15 * pred_x
     smoothed_y = 0.85 * det_y + 0.15 * pred_y
@@ -731,10 +741,35 @@ def _annotate_camera(
     row["camera_v"] = "" if camera_v is None else round(camera_v, 2)
     row["camera_score"] = float(visible_score if synced else 0.0)
     row["camera_validated"] = validated
-    # Camera projection is a sanity check only. The bag has no calibrated
-    # camera detector, so this must not count as sensor support or boost
-    # fusion confidence.
-    row["n_camera"] = 0
+
+    # Camera fusion: when a synced frame confirms the detection projects
+    # into the image (score >= 1.0 = centre in frame; 0.5 = corner only),
+    # count camera as a contributing sensor and apply a confidence boost.
+    # Score 0.0 means the detection does NOT appear in the camera image —
+    # treat as mild negative evidence (confidence penalty).
+    if validated and visible_score >= 1.0:
+        # Full confirmation: centre of detection is in the image.
+        row["n_camera"] = 1
+        sensors_str = str(row.get("sensors", ""))
+        sensor_label = _sensor_label(topic) if topic else "camera"
+        if sensor_label not in sensors_str:
+            row["sensors"] = (sensors_str + "+" + sensor_label).lstrip("+")
+        row["confidence"] = float(np.clip(float(row["confidence"]) + 0.07, 0.0, 1.0))
+    elif validated and visible_score >= 0.5:
+        # Partial: only corners visible — small boost.
+        row["n_camera"] = 1
+        sensors_str = str(row.get("sensors", ""))
+        sensor_label = _sensor_label(topic) if topic else "camera"
+        if sensor_label not in sensors_str:
+            row["sensors"] = (sensors_str + "+" + sensor_label).lstrip("+")
+        row["confidence"] = float(np.clip(float(row["confidence"]) + 0.03, 0.0, 1.0))
+    elif synced and visible_score == 0.0:
+        # Synced camera frame exists but detection is not visible in image —
+        # mild negative evidence (likely a false positive or rear/side object).
+        row["n_camera"] = 0
+        row["confidence"] = float(np.clip(float(row["confidence"]) - 0.05, 0.0, 1.0))
+    else:
+        row["n_camera"] = 0
 
 
 def _camera_projection_score(row: dict[str, Any]) -> tuple[float | None, float | None, float]:
@@ -776,6 +811,16 @@ def _sensor_label(topic: str) -> str:
     if len(parts) >= 3 and parts[0] == "sensor":
         return parts[1]
     return topic.replace("/", "_").strip("_") or "camera"
+
+
+def _wrap_angle_diff(diff: float) -> float:
+    """Wrap an angular difference to (-π, π]."""
+    return (diff + math.pi) % (2 * math.pi) - math.pi
+
+
+def _wrap_angle_pi(angle: float) -> float:
+    """Wrap an angle to (-π, π]."""
+    return (angle + math.pi) % (2 * math.pi) - math.pi
 
 
 def _limit_velocity_pair(
