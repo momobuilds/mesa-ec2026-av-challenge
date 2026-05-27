@@ -7,14 +7,22 @@ deserialization of ``sensor_msgs/msg/PointCloud2``.
 
 from __future__ import annotations
 
+import argparse
 from dataclasses import dataclass, field
+import json
+import math
 from pathlib import Path
 import sqlite3
+import sys
+import xml.etree.ElementTree as ET
 from typing import Any, Iterable
 
 import numpy as np
 import pandas as pd
 from sklearn.cluster import DBSCAN
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.bag_inspector import (
     BagSummary,
@@ -36,22 +44,32 @@ except ImportError as exc:  # pragma: no cover - exercised only when missing.
 
 
 POINTCLOUD2_TYPE = "sensor_msgs/msg/PointCloud2"
-DEFAULT_MAX_FRAMES = 200
+DEFAULT_MAX_FRAMES: int | None = None
 DEFAULT_MAX_PLOTS = 200
 DETECTION_COLUMNS = [
     "timestamp",
+    "timestamp_ns",
     "topic",
     "source_frame",
+    "sensor_frame",
+    "base_frame",
     "frame_index",
+    "frame_idx",
     "detection_id",
     "center_x",
     "center_y",
+    "center_x_base",
+    "center_y_base",
     "width",
     "length",
     "min_x",
     "max_x",
     "min_y",
     "max_y",
+    "min_x_base",
+    "max_x_base",
+    "min_y_base",
+    "max_y_base",
     "point_count",
     "confidence",
 ]
@@ -73,11 +91,88 @@ class AxisMapping:
     reason: str
 
 
+@dataclass(frozen=True)
+class UrdfJoint:
+    """One fixed URDF joint represented as a parent<-child transform."""
+
+    name: str
+    parent: str
+    child: str
+    transform_parent_child: np.ndarray
+
+
+@dataclass
+class UrdfGeometry:
+    """Small URDF frame graph used to locate sensors relative to the ego frame."""
+
+    path: Path
+    links: set[str]
+    joints: list[UrdfJoint]
+    mesh_filenames: list[str] = field(default_factory=list)
+
+    def select_base_frame(self, requested: str | None = None) -> str:
+        """Return the requested base frame or the best ego-frame available."""
+
+        if requested:
+            frame = _canonical_frame_name(requested)
+            if frame not in self.links:
+                raise ValueError(
+                    f"URDF base frame {requested!r} was not found. "
+                    f"Available links include: {', '.join(sorted(self.links)[:12])}"
+                )
+            return frame
+
+        for candidate in ("base_link", "ego", "center_of_gravity", "rear_axle_middle_ground"):
+            if candidate in self.links:
+                return candidate
+        raise ValueError("URDF does not contain a recognizable base/ego frame")
+
+    def transform_sensor_to_base(self, sensor_frame: str, base_frame: str) -> np.ndarray:
+        """Return a 4x4 matrix T where ``p_base = T @ p_sensor``."""
+
+        sensor = _canonical_frame_name(sensor_frame)
+        base = self.select_base_frame(base_frame)
+        if sensor not in self.links:
+            raise ValueError(
+                f"URDF sensor frame {sensor_frame!r} was not found. "
+                f"Available links include: {', '.join(sorted(self.links)[:12])}"
+            )
+
+        adjacency: dict[str, list[tuple[str, np.ndarray]]] = {}
+        for joint in self.joints:
+            # transform_parent_child maps child coordinates into parent coordinates.
+            adjacency.setdefault(joint.parent, []).append(
+                (joint.child, joint.transform_parent_child)
+            )
+            adjacency.setdefault(joint.child, []).append(
+                (joint.parent, np.linalg.inv(joint.transform_parent_child))
+            )
+
+        queue: list[tuple[str, np.ndarray]] = [(base, np.eye(4, dtype=np.float64))]
+        visited = {base}
+        while queue:
+            current, transform_base_current = queue.pop(0)
+            if current == sensor:
+                return transform_base_current
+            for neighbor, transform_current_neighbor in adjacency.get(current, []):
+                if neighbor in visited:
+                    continue
+                visited.add(neighbor)
+                queue.append(
+                    (neighbor, transform_base_current @ transform_current_neighbor)
+                )
+
+        raise ValueError(
+            f"No fixed-joint transform path found in {self.path} from "
+            f"sensor frame {sensor!r} to base frame {base!r}."
+        )
+
+
 @dataclass
 class DetectionConfig:
     """Clustering and filtering parameters for the first-pass detector."""
 
-    max_frames: int = DEFAULT_MAX_FRAMES
+    max_frames: int | None = DEFAULT_MAX_FRAMES
     output_dir: Path = Path("outputs/task1")
     forward_range: tuple[float, float] = (3.0, 95.0)
     lateral_range: tuple[float, float] = (-18.0, 18.0)
@@ -93,6 +188,25 @@ class DetectionConfig:
     max_length: float = 9.0
     max_plots: int = DEFAULT_MAX_PLOTS
     ground_band_half_height: float = 0.30
+    ego_length: float = 5.0
+    ego_width: float = 2.2
+    ego_height: float = 1.6
+    safety_margin: float = 0.25
+
+
+@dataclass
+class FilteredPointCloud:
+    """Point cloud snapshots and counters from the Task 1 filter chain."""
+
+    raw_points: np.ndarray
+    after_ground_points: np.ndarray
+    after_ego_points: np.ndarray
+    final_points: np.ndarray
+    raw_bev_points: np.ndarray
+    after_ground_bev_points: np.ndarray
+    after_ego_bev_points: np.ndarray
+    final_bev_points: np.ndarray
+    stats: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -105,6 +219,16 @@ class FrameResult:
     source_frame: str
     bev_points: np.ndarray
     detections: list[dict[str, Any]]
+    sensor_frame: str = ""
+    base_frame: str = ""
+    raw_bev_points: np.ndarray = field(
+        default_factory=lambda: np.zeros((0, 2), dtype=np.float32)
+    )
+    after_ego_bev_points: np.ndarray = field(
+        default_factory=lambda: np.zeros((0, 2), dtype=np.float32)
+    )
+    filter_stats: dict[str, Any] = field(default_factory=dict)
+    cluster_stats: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -118,16 +242,209 @@ class PipelineResult:
     detections: pd.DataFrame = field(default_factory=pd.DataFrame)
     diagnostics: list[str] = field(default_factory=list)
     output_dir: Path = Path("outputs/task1")
+    urdf_path: Path | None = None
+    base_frame: str | None = None
+    sensor_to_base_transforms: dict[str, np.ndarray] = field(default_factory=dict)
+
+
+def parse_max_frames_arg(value: str | int | None) -> int | None:
+    """Parse CLI/API frame limits where ``all`` means no artificial limit."""
+
+    if value is None:
+        return None
+    if isinstance(value, int):
+        if value < 1:
+            raise argparse.ArgumentTypeError("max_frames must be positive or 'all'")
+        return value
+    text = str(value).strip().lower()
+    if text == "all":
+        return None
+    try:
+        parsed = int(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"invalid max frame value {value!r}; use a positive integer or 'all'"
+        ) from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("max_frames must be positive or 'all'")
+    return parsed
+
+
+def load_urdf_geometry(urdf_path: str | Path) -> UrdfGeometry:
+    """Parse fixed links/joints from a URDF without requiring ROS."""
+
+    path = Path(urdf_path)
+    if not path.exists():
+        raise FileNotFoundError(f"URDF file not found: {path}")
+
+    root = ET.parse(path).getroot()
+    links = {
+        _canonical_frame_name(link.attrib["name"])
+        for link in root.findall("link")
+        if "name" in link.attrib
+    }
+    mesh_filenames = [
+        str(mesh.attrib.get("filename", ""))
+        for mesh in root.findall(".//mesh")
+        if mesh.attrib.get("filename")
+    ]
+    joints: list[UrdfJoint] = []
+
+    for joint_xml in root.findall("joint"):
+        joint_type = str(joint_xml.attrib.get("type", ""))
+        if joint_type and joint_type != "fixed":
+            continue
+        parent_xml = joint_xml.find("parent")
+        child_xml = joint_xml.find("child")
+        if parent_xml is None or child_xml is None:
+            continue
+        parent = _canonical_frame_name(str(parent_xml.attrib.get("link", "")))
+        child = _canonical_frame_name(str(child_xml.attrib.get("link", "")))
+        if not parent or not child:
+            continue
+
+        origin = joint_xml.find("origin")
+        xyz = _parse_float_triplet(origin.attrib.get("xyz", "0 0 0") if origin is not None else "0 0 0")
+        rpy = _parse_float_triplet(origin.attrib.get("rpy", "0 0 0") if origin is not None else "0 0 0")
+        joints.append(
+            UrdfJoint(
+                name=str(joint_xml.attrib.get("name", f"{parent}_to_{child}")),
+                parent=parent,
+                child=child,
+                transform_parent_child=_homogeneous_from_xyz_rpy(xyz, rpy),
+            )
+        )
+        links.update({parent, child})
+
+    return UrdfGeometry(path=path, links=links, joints=joints, mesh_filenames=mesh_filenames)
+
+
+def transform_structured_points_to_base(
+    structured_points: np.ndarray,
+    transform_sensor_to_base: np.ndarray,
+) -> np.ndarray:
+    """Extract raw x/y/z fields and transform them into the URDF base frame."""
+
+    for field_name in ("x", "y", "z"):
+        if field_name not in structured_points.dtype.names:
+            raise ValueError(
+                "URDF projection requires PointCloud2 fields x, y, z; "
+                f"available fields: {structured_points.dtype.names}"
+            )
+
+    x_s = structured_points["x"].astype(np.float64, copy=False)
+    y_s = structured_points["y"].astype(np.float64, copy=False)
+    z_s = structured_points["z"].astype(np.float64, copy=False)
+    finite = np.isfinite(x_s) & np.isfinite(y_s) & np.isfinite(z_s)
+    if not finite.any():
+        return np.zeros((0, 3), dtype=np.float64)
+
+    sensor_xyz = np.column_stack((x_s[finite], y_s[finite], z_s[finite]))
+    ones = np.ones((len(sensor_xyz), 1), dtype=np.float64)
+    homogeneous = np.concatenate((sensor_xyz, ones), axis=1)
+    return (transform_sensor_to_base @ homogeneous.T).T[:, :3]
+
+
+def filter_base_points_for_detection(
+    base_xyz: np.ndarray,
+    config: DetectionConfig,
+) -> FilteredPointCloud:
+    """Apply ground, ego-self, and spatial filters in URDF base coordinates.
+
+    URDF gives the detector a physical ego frame. That makes the self-filter
+    meaningful: points inside the configurable vehicle safety box are removed
+    before BEV clustering instead of being treated as opponent candidates.
+    """
+
+    if len(base_xyz) == 0:
+        empty_xyz = np.zeros((0, 3), dtype=np.float64)
+        empty_bev = np.zeros((0, 2), dtype=np.float32)
+        return FilteredPointCloud(
+            raw_points=empty_xyz,
+            after_ground_points=empty_xyz,
+            after_ego_points=empty_xyz,
+            final_points=empty_xyz,
+            raw_bev_points=empty_bev,
+            after_ground_bev_points=empty_bev,
+            after_ego_bev_points=empty_bev,
+            final_bev_points=empty_bev,
+            stats={
+                "raw_points": 0,
+                "ground_filter_points_rejected": 0,
+                "ego_self_points_rejected": 0,
+                "spatial_crop_points_rejected": 0,
+            },
+        )
+
+    points = np.asarray(base_xyz, dtype=np.float64)
+    finite = np.isfinite(points).all(axis=1)
+    raw_points = points[finite]
+
+    ground_mask = np.zeros(len(raw_points), dtype=bool)
+    ground_z: float | None = None
+    if config.ground_band_half_height > 0 and len(raw_points) > 10:
+        horizontal = np.hypot(raw_points[:, 0], raw_points[:, 1])
+        close = (horizontal >= 2.0) & (horizontal <= 25.0)
+        if int(close.sum()) > 10:
+            ground_z = float(np.median(raw_points[close, 2]))
+            ground_mask = np.abs(raw_points[:, 2] - ground_z) <= config.ground_band_half_height
+    after_ground = raw_points[~ground_mask]
+
+    half_length = config.ego_length / 2.0 + config.safety_margin
+    half_width = config.ego_width / 2.0 + config.safety_margin
+    half_height = config.ego_height / 2.0 + config.safety_margin
+    ego_mask = (
+        (np.abs(after_ground[:, 0]) <= half_length)
+        & (np.abs(after_ground[:, 1]) <= half_width)
+        & (np.abs(after_ground[:, 2]) <= half_height)
+    )
+    after_ego = after_ground[~ego_mask]
+
+    spatial_mask = _spatial_mask(after_ego, config)
+    final_points = after_ego[spatial_mask]
+
+    stats = {
+        "input_points": int(len(points)),
+        "finite_points": int(len(raw_points)),
+        "raw_points": int(len(raw_points)),
+        "ground_filter_enabled": bool(config.ground_band_half_height > 0),
+        "ground_z_estimate": ground_z,
+        "ground_filter_points_rejected": int(ground_mask.sum()),
+        "ego_self_points_rejected": int(ego_mask.sum()),
+        "spatial_crop_points_rejected": int((~spatial_mask).sum()),
+        "final_points": int(len(final_points)),
+    }
+
+    return FilteredPointCloud(
+        raw_points=raw_points,
+        after_ground_points=after_ground,
+        after_ego_points=after_ego,
+        final_points=final_points,
+        raw_bev_points=_bev_from_points(raw_points[_spatial_mask(raw_points, config)]),
+        after_ground_bev_points=_bev_from_points(
+            after_ground[_spatial_mask(after_ground, config)]
+        ),
+        after_ego_bev_points=_bev_from_points(after_ego[_spatial_mask(after_ego, config)]),
+        final_bev_points=_bev_from_points(final_points),
+        stats=stats,
+    )
 
 
 def run_task1_pipeline(
     bag_dir: str | Path,
     *,
-    max_frames: int = DEFAULT_MAX_FRAMES,
+    max_frames: int | str | None = DEFAULT_MAX_FRAMES,
     max_plots: int = DEFAULT_MAX_PLOTS,
     output_dir: str | Path = "outputs/task1",
     topic_name: str | None = None,
     ground_filter: bool = True,
+    urdf_path: str | Path | None = None,
+    base_frame: str | None = None,
+    allow_identity_transform: bool = False,
+    ego_length: float = 5.0,
+    ego_width: float = 2.2,
+    ego_height: float = 1.6,
+    safety_margin: float = 0.25,
 ) -> PipelineResult:
     """Run metadata inspection, point-cloud detection, CSV export, and plots."""
 
@@ -135,13 +452,24 @@ def run_task1_pipeline(
     output_path.mkdir(parents=True, exist_ok=True)
 
     summary = parse_bag_summary(bag_dir)
+    effective_max_frames = parse_max_frames_arg(max_frames)
     config = DetectionConfig(
-        max_frames=max_frames,
+        max_frames=effective_max_frames,
         max_plots=max_plots,
         output_dir=output_path,
         ground_band_half_height=0.30 if ground_filter else 0.0,
+        ego_length=ego_length,
+        ego_width=ego_width,
+        ego_height=ego_height,
+        safety_margin=safety_margin,
     )
     diagnostics: list[str] = []
+    urdf_geometry, resolved_base_frame = _load_optional_urdf(
+        summary.bag_dir,
+        urdf_path,
+        base_frame,
+        diagnostics,
+    )
 
     selected_topic = _resolve_topic(summary, topic_name, diagnostics)
     if selected_topic is None:
@@ -156,6 +484,8 @@ def run_task1_pipeline(
             axis_mapping=None,
             diagnostics=diagnostics,
             output_dir=output_path,
+            urdf_path=urdf_geometry.path if urdf_geometry else None,
+            base_frame=resolved_base_frame,
         )
         _write_outputs(result, config)
         return result
@@ -164,9 +494,13 @@ def run_task1_pipeline(
     frames: list[FrameResult] = []
     all_detections: list[dict[str, Any]] = []
     axis_mapping: AxisMapping | None = None
+    transform_cache: dict[str, np.ndarray] = {}
 
     for frame_index, message in enumerate(
-        reader.iter_pointcloud_messages(selected_topic.name, max_frames=max_frames)
+        reader.iter_pointcloud_messages(
+            selected_topic.name,
+            max_frames=effective_max_frames,
+        )
     ):
         try:
             structured_points = pointcloud2_to_structured_array(message["msg"])
@@ -177,29 +511,54 @@ def run_task1_pipeline(
             )
             continue
 
-        if axis_mapping is None:
-            axis_mapping = infer_axis_mapping(
-                selected_topic.name,
-                structured_points,
-                message["msg"].fields,
-            )
-            diagnostics.append(
-                "Axis mapping: "
-                f"forward={axis_mapping.forward}, lateral={axis_mapping.lateral}, "
-                f"vertical={axis_mapping.vertical or 'none'} ({axis_mapping.reason})"
-            )
-
-        bev_points = extract_bev_points(
-            structured_points, axis_mapping, config, frame_index=frame_index
-        )
+        sensor_frame = _message_sensor_frame(message["source_frame"], selected_topic.name)
         sensor_kind = "radar" if "radar" in selected_topic.name.lower() else "lidar"
-        detections = detect_opponents_in_frame(
+
+        if urdf_geometry is not None and resolved_base_frame is not None:
+            transform = _resolve_sensor_transform(
+                urdf_geometry,
+                sensor_frame,
+                resolved_base_frame,
+                allow_identity_transform=allow_identity_transform,
+                diagnostics=diagnostics,
+                cache=transform_cache,
+            )
+            base_xyz = transform_structured_points_to_base(structured_points, transform)
+            filtered = filter_base_points_for_detection(base_xyz, config)
+            _add_filter_cluster_diagnostics(filtered, sensor_kind, config)
+            bev_points = filtered.final_bev_points
+        else:
+            if axis_mapping is None:
+                axis_mapping = infer_axis_mapping(
+                    selected_topic.name,
+                    structured_points,
+                    message["msg"].fields,
+                )
+                diagnostics.append(
+                    "Axis mapping: "
+                    f"forward={axis_mapping.forward}, lateral={axis_mapping.lateral}, "
+                    f"vertical={axis_mapping.vertical or 'none'} ({axis_mapping.reason})"
+                )
+                diagnostics.append(
+                    "No URDF transform is active; BEV projection uses legacy "
+                    "axis inference. Pass --urdf-path for geometry-backed evidence."
+                )
+
+            bev_points = extract_bev_points(
+                structured_points, axis_mapping, config, frame_index=frame_index
+            )
+            filtered = _legacy_filtered_point_cloud(bev_points)
+            _add_filter_cluster_diagnostics(filtered, sensor_kind, config)
+
+        detections, cluster_stats = detect_opponents_with_diagnostics(
             bev_points,
             sensor_kind=sensor_kind,
             config=config,
             timestamp_ns=message["timestamp_ns"],
             topic=selected_topic.name,
             source_frame=message["source_frame"],
+            sensor_frame=sensor_frame,
+            base_frame=resolved_base_frame or "legacy_inferred_bev",
             frame_index=frame_index,
         )
 
@@ -211,6 +570,12 @@ def run_task1_pipeline(
                 source_frame=message["source_frame"],
                 bev_points=bev_points,
                 detections=detections,
+                sensor_frame=sensor_frame,
+                base_frame=resolved_base_frame or "legacy_inferred_bev",
+                raw_bev_points=filtered.raw_bev_points,
+                after_ego_bev_points=filtered.after_ego_bev_points,
+                filter_stats=filtered.stats,
+                cluster_stats=cluster_stats,
             )
         )
         all_detections.extend(detections)
@@ -231,6 +596,9 @@ def run_task1_pipeline(
         detections=detections_df,
         diagnostics=diagnostics,
         output_dir=output_path,
+        urdf_path=urdf_geometry.path if urdf_geometry else None,
+        base_frame=resolved_base_frame,
+        sensor_to_base_transforms=transform_cache,
     )
     _write_outputs(result, config)
     return result
@@ -247,13 +615,13 @@ class SQLitePointCloudReader:
         self,
         topic_name: str,
         *,
-        max_frames: int,
+        max_frames: int | None,
     ) -> Iterable[dict[str, Any]]:
-        """Yield at most ``max_frames`` deserialized point cloud messages."""
+        """Yield deserialized point cloud messages, optionally capped."""
 
         yielded = 0
         for db_path in self._db_paths():
-            if yielded >= max_frames:
+            if max_frames is not None and yielded >= max_frames:
                 break
             with sqlite3.connect(str(db_path)) as connection:
                 topic_row = connection.execute(
@@ -270,11 +638,17 @@ class SQLitePointCloudReader:
                         f"expected {POINTCLOUD2_TYPE}"
                     )
 
-                remaining = max_frames - yielded
-                rows = connection.execute(
-                    "select timestamp, data from messages where topic_id = ? limit ?",
-                    (topic_id, remaining),
-                )
+                if max_frames is None:
+                    rows = connection.execute(
+                        "select timestamp, data from messages where topic_id = ?",
+                        (topic_id,),
+                    )
+                else:
+                    remaining = max_frames - yielded
+                    rows = connection.execute(
+                        "select timestamp, data from messages where topic_id = ? limit ?",
+                        (topic_id, remaining),
+                    )
                 for timestamp_ns, raw_data in rows:
                     msg = self.typestore.deserialize_cdr(raw_data, POINTCLOUD2_TYPE)
                     yielded += 1
@@ -520,6 +894,108 @@ def detect_opponents_in_frame(
     return detections
 
 
+def detect_opponents_with_diagnostics(
+    bev_points: np.ndarray,
+    *,
+    sensor_kind: str,
+    config: DetectionConfig,
+    timestamp_ns: int,
+    topic: str,
+    source_frame: str,
+    sensor_frame: str,
+    base_frame: str,
+    frame_index: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Cluster BEV points and return retained detections plus rejection counts."""
+
+    if len(bev_points) == 0:
+        return [], _empty_cluster_stats()
+
+    is_radar = sensor_kind == "radar"
+    eps = config.dbscan_eps_radar if is_radar else config.dbscan_eps_lidar
+    min_samples = (
+        config.dbscan_min_samples_radar if is_radar else config.dbscan_min_samples_lidar
+    )
+    min_points = config.min_points_radar if is_radar else config.min_points_lidar
+
+    labels = DBSCAN(eps=eps, min_samples=min_samples, n_jobs=-1).fit_predict(bev_points)
+    detections: list[dict[str, Any]] = []
+    detection_id = 0
+    stats = _empty_cluster_stats()
+    stats["dbscan_cluster_count"] = int(len(set(labels)) - (1 if -1 in labels else 0))
+    stats["dbscan_noise_points"] = int((labels == -1).sum())
+
+    for label in sorted(set(labels)):
+        if label == -1:
+            continue
+        cluster = bev_points[labels == label]
+        point_count = len(cluster)
+        stats["all_cluster_point_counts"].append(int(point_count))
+        if point_count < min_points:
+            stats["point_count_filter_rejected_clusters"] += 1
+            continue
+
+        min_forward, min_lateral = cluster.min(axis=0)
+        max_forward, max_lateral = cluster.max(axis=0)
+        length = float(max_forward - min_forward)
+        width = float(max_lateral - min_lateral)
+
+        if not (
+            config.min_width <= width <= config.max_width
+            and config.min_length <= length <= config.max_length
+        ):
+            stats["vehicle_size_filter_rejected_clusters"] += 1
+            continue
+
+        center_forward = float((min_forward + max_forward) / 2.0)
+        center_lateral = float((min_lateral + max_lateral) / 2.0)
+        confidence = _cluster_confidence(
+            point_count=point_count,
+            width=width,
+            length=length,
+            center_forward=center_forward,
+            config=config,
+            is_radar=is_radar,
+        )
+
+        detections.append(
+            {
+                "timestamp": timestamp_ns,
+                "timestamp_ns": timestamp_ns,
+                "topic": topic,
+                "source_frame": source_frame,
+                "sensor_frame": sensor_frame,
+                "base_frame": base_frame,
+                "frame_index": frame_index,
+                "frame_idx": frame_index,
+                "detection_id": f"{frame_index:04d}_{detection_id:02d}",
+                "center_x": center_forward,
+                "center_y": center_lateral,
+                "center_x_base": center_forward,
+                "center_y_base": center_lateral,
+                "width": width,
+                "length": length,
+                "min_x": float(min_forward),
+                "max_x": float(max_forward),
+                "min_y": float(min_lateral),
+                "max_y": float(max_lateral),
+                "min_x_base": float(min_forward),
+                "max_x_base": float(max_forward),
+                "min_y_base": float(min_lateral),
+                "max_y_base": float(max_lateral),
+                "point_count": point_count,
+                "confidence": confidence,
+            }
+        )
+        stats["retained_clusters"] += 1
+        stats["retained_cluster_point_counts"].append(int(point_count))
+        stats["retained_widths"].append(width)
+        stats["retained_lengths"].append(length)
+        detection_id += 1
+
+    return detections, stats
+
+
 def detect_vehicle_candidates(
     bev_points: np.ndarray,
     *,
@@ -574,10 +1050,183 @@ def _resolve_topic(
     return topic
 
 
+def _load_optional_urdf(
+    bag_dir: Path,
+    urdf_path: str | Path | None,
+    base_frame: str | None,
+    diagnostics: list[str],
+) -> tuple[UrdfGeometry | None, str | None]:
+    candidate: Path | None = Path(urdf_path) if urdf_path is not None else None
+    if candidate is None:
+        default_candidate = bag_dir / "eva.urdf"
+        if default_candidate.exists():
+            candidate = default_candidate
+
+    if candidate is None:
+        diagnostics.append(
+            "No URDF path was provided and no eva.urdf was found beside the bag; "
+            "using legacy axis-inferred BEV projection."
+        )
+        return None, None
+
+    geometry = load_urdf_geometry(candidate)
+    selected_base = geometry.select_base_frame(base_frame)
+    diagnostics.append(f"Loaded URDF geometry: {geometry.path.as_posix()}")
+    diagnostics.append(f"URDF base/ego frame: {selected_base}")
+    if geometry.mesh_filenames:
+        diagnostics.append(
+            "URDF mesh geometry is referenced but not dimensioned in the URDF; "
+            "using configurable ego_length/ego_width/ego_height safety box."
+        )
+    return geometry, selected_base
+
+
+def _resolve_sensor_transform(
+    geometry: UrdfGeometry,
+    sensor_frame: str,
+    base_frame: str,
+    *,
+    allow_identity_transform: bool,
+    diagnostics: list[str],
+    cache: dict[str, np.ndarray],
+) -> np.ndarray:
+    cache_key = f"{base_frame}<-{_canonical_frame_name(sensor_frame)}"
+    if cache_key in cache:
+        return cache[cache_key]
+    try:
+        transform = geometry.transform_sensor_to_base(sensor_frame, base_frame)
+    except ValueError as exc:
+        if not allow_identity_transform:
+            raise ValueError(
+                f"Could not resolve URDF transform from sensor frame {sensor_frame!r} "
+                f"to base frame {base_frame!r}: {exc} "
+                "Pass --allow-identity-transform only for debugging."
+            ) from exc
+        transform = np.eye(4, dtype=np.float64)
+        diagnostics.append(
+            f"WARNING: using identity transform for {sensor_frame}->{base_frame} "
+            "because --allow-identity-transform was passed."
+        )
+    cache[cache_key] = transform
+    t = transform[:3, 3]
+    diagnostics.append(
+        f"URDF transform {sensor_frame}->{base_frame}: "
+        f"translation=[{t[0]:.3f}, {t[1]:.3f}, {t[2]:.3f}] m"
+    )
+    return transform
+
+
+def _message_sensor_frame(source_frame: str, topic_name: str) -> str:
+    frame = _canonical_frame_name(source_frame)
+    if frame:
+        return frame
+    parts = [part for part in topic_name.split("/") if part]
+    if len(parts) >= 2 and parts[0] == "sensor":
+        return _canonical_frame_name(parts[1])
+    return _canonical_frame_name(topic_name)
+
+
+def _legacy_filtered_point_cloud(bev_points: np.ndarray) -> FilteredPointCloud:
+    if len(bev_points) == 0:
+        points = np.zeros((0, 3), dtype=np.float64)
+        bev = np.zeros((0, 2), dtype=np.float32)
+    else:
+        bev = np.asarray(bev_points, dtype=np.float32)
+        points = np.column_stack(
+            (
+                bev[:, 0].astype(np.float64),
+                bev[:, 1].astype(np.float64),
+                np.zeros(len(bev)),
+            )
+        )
+    return FilteredPointCloud(
+        raw_points=points,
+        after_ground_points=points,
+        after_ego_points=points,
+        final_points=points,
+        raw_bev_points=bev,
+        after_ground_bev_points=bev,
+        after_ego_bev_points=bev,
+        final_bev_points=bev,
+        stats={
+            "input_points": int(len(points)),
+            "finite_points": int(len(points)),
+            "raw_points": int(len(points)),
+            "ground_filter_points_rejected": 0,
+            "ego_self_points_rejected": 0,
+            "spatial_crop_points_rejected": 0,
+            "final_points": int(len(points)),
+            "legacy_axis_inference": True,
+        },
+    )
+
+
+def _add_filter_cluster_diagnostics(
+    filtered: FilteredPointCloud,
+    sensor_kind: str,
+    config: DetectionConfig,
+) -> None:
+    raw_clusters = _count_dbscan_clusters(filtered.raw_bev_points, sensor_kind, config)
+    after_ground_clusters = _count_dbscan_clusters(
+        filtered.after_ground_bev_points,
+        sensor_kind,
+        config,
+    )
+    after_ego_clusters = _count_dbscan_clusters(
+        filtered.after_ego_bev_points,
+        sensor_kind,
+        config,
+    )
+    filtered.stats.update(
+        {
+            "raw_cluster_count": raw_clusters,
+            "after_ground_cluster_count": after_ground_clusters,
+            "after_ego_cluster_count": after_ego_clusters,
+            "ground_filter_clusters_reduced": max(0, raw_clusters - after_ground_clusters),
+            "ego_self_filter_clusters_reduced": max(
+                0,
+                after_ground_clusters - after_ego_clusters,
+            ),
+        }
+    )
+
+
+def _count_dbscan_clusters(
+    bev_points: np.ndarray,
+    sensor_kind: str,
+    config: DetectionConfig,
+) -> int:
+    if len(bev_points) == 0:
+        return 0
+    is_radar = sensor_kind == "radar"
+    eps = config.dbscan_eps_radar if is_radar else config.dbscan_eps_lidar
+    min_samples = (
+        config.dbscan_min_samples_radar if is_radar else config.dbscan_min_samples_lidar
+    )
+    labels = DBSCAN(eps=eps, min_samples=min_samples, n_jobs=-1).fit_predict(bev_points)
+    return int(len(set(labels)) - (1 if -1 in labels else 0))
+
+
+def _empty_cluster_stats() -> dict[str, Any]:
+    return {
+        "dbscan_cluster_count": 0,
+        "dbscan_noise_points": 0,
+        "point_count_filter_rejected_clusters": 0,
+        "vehicle_size_filter_rejected_clusters": 0,
+        "retained_clusters": 0,
+        "all_cluster_point_counts": [],
+        "retained_cluster_point_counts": [],
+        "retained_widths": [],
+        "retained_lengths": [],
+    }
+
+
 def _write_outputs(result: PipelineResult, config: DetectionConfig) -> None:
     detections_csv = result.output_dir / "detections.csv"
     evaluation_csv = result.output_dir / "evaluation_summary.csv"
+    evaluation_json = result.output_dir / "evaluation_summary.json"
     report_md = result.output_dir / "task1_report.md"
+    evaluation_metrics = build_evaluation_metrics(result, config)
     evaluation_rows = build_evaluation_summary(result, config)
 
     if result.detections.empty:
@@ -589,8 +1238,13 @@ def _write_outputs(result: PipelineResult, config: DetectionConfig) -> None:
         evaluation_csv,
         index=False,
     )
+    evaluation_json.write_text(
+        json.dumps(evaluation_metrics, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
 
-    for frame in result.frames[: config.max_plots]:
+    plot_limit = len(result.frames) if config.max_plots is None else config.max_plots
+    for frame in result.frames[:plot_limit]:
         plot_bev_frame(
             frame.bev_points,
             frame.detections,
@@ -600,7 +1254,134 @@ def _write_outputs(result: PipelineResult, config: DetectionConfig) -> None:
             lateral_range=config.lateral_range,
         )
 
-    report_md.write_text(_build_report(result, evaluation_rows), encoding="utf-8")
+    if result.frames:
+        _plot_detection_count_over_time(
+            result.frames,
+            result.output_dir / "detection_count_over_time.png",
+        )
+        _write_representative_bev_plots(result, config)
+
+    report_md.write_text(
+        _build_report(result, evaluation_rows, evaluation_metrics, config),
+        encoding="utf-8",
+    )
+
+
+def build_evaluation_metrics(
+    result: PipelineResult,
+    config: DetectionConfig,
+) -> dict[str, Any]:
+    """Build label-free evaluation evidence for robustness and filtering."""
+
+    detections = result.detections
+    detections_per_frame = [len(frame.detections) for frame in result.frames]
+    frames_processed = len(result.frames)
+    frames_with_detections = int(sum(count > 0 for count in detections_per_frame))
+
+    filter_totals = _sum_frame_stats(frame.filter_stats for frame in result.frames)
+    cluster_totals = _sum_frame_stats(frame.cluster_stats for frame in result.frames)
+    all_cluster_sizes = _flatten_stat_lists(result.frames, "all_cluster_point_counts")
+    retained_cluster_sizes = _flatten_stat_lists(result.frames, "retained_cluster_point_counts")
+    temporal = _temporal_robustness_metrics(detections_per_frame)
+
+    raw_clusters = int(filter_totals.get("raw_cluster_count", 0))
+    after_ground = int(filter_totals.get("after_ground_cluster_count", 0))
+    after_ego = int(filter_totals.get("after_ego_cluster_count", 0))
+    final_detections = int(len(detections))
+
+    metrics: dict[str, Any] = {
+        "labelled_metrics_available": False,
+        "labelled_metrics_note": (
+            "No labelled opponent boxes/positions are available, so precision, "
+            "recall, center error, and IoU cannot be computed honestly."
+        ),
+        "frames": {
+            "total_frames_processed": frames_processed,
+            "max_frames_argument": "all" if config.max_frames is None else config.max_frames,
+            "frames_with_detections": frames_with_detections,
+            "frames_with_detections_percent": _percent(
+                frames_with_detections,
+                frames_processed,
+            ),
+        },
+        "detections": {
+            "total_detections": final_detections,
+            "detections_per_frame": _numeric_stats(detections_per_frame),
+            "cluster_size_points_all_dbscan_clusters": _numeric_stats(all_cluster_sizes),
+            "cluster_size_points_retained": _numeric_stats(retained_cluster_sizes),
+            "bbox_width_m": _series_stats(detections, "width"),
+            "bbox_length_m": _series_stats(detections, "length"),
+        },
+        "filters": {
+            "ground_filter_points_rejected": int(
+                filter_totals.get("ground_filter_points_rejected", 0)
+            ),
+            "ground_filter_clusters_reduced": int(
+                filter_totals.get("ground_filter_clusters_reduced", 0)
+            ),
+            "ego_self_points_rejected": int(filter_totals.get("ego_self_points_rejected", 0)),
+            "ego_self_clusters_reduced": int(
+                filter_totals.get("ego_self_filter_clusters_reduced", 0)
+            ),
+            "point_count_filter_rejected_clusters": int(
+                cluster_totals.get("point_count_filter_rejected_clusters", 0)
+            ),
+            "vehicle_size_filter_rejected_clusters": int(
+                cluster_totals.get("vehicle_size_filter_rejected_clusters", 0)
+            ),
+            "raw_clusters_before_filters": raw_clusters,
+            "clusters_after_ground_filter": after_ground,
+            "clusters_after_ego_filter": after_ego,
+            "final_detections_after_all_filters": final_detections,
+            "overall_cluster_to_detection_reduction_percent": _percent(
+                max(raw_clusters - final_detections, 0),
+                raw_clusters,
+            ),
+            "ground_filter_cluster_reduction_percent": _percent(
+                int(filter_totals.get("ground_filter_clusters_reduced", 0)),
+                raw_clusters,
+            ),
+            "ego_filter_cluster_reduction_percent": _percent(
+                int(filter_totals.get("ego_self_filter_clusters_reduced", 0)),
+                after_ground,
+            ),
+            "point_count_cluster_rejection_percent": _percent(
+                int(cluster_totals.get("point_count_filter_rejected_clusters", 0)),
+                after_ego,
+            ),
+            "vehicle_size_cluster_rejection_percent": _percent(
+                int(cluster_totals.get("vehicle_size_filter_rejected_clusters", 0)),
+                after_ego,
+            ),
+            "ego_box_defaults": {
+                "ego_length_m": config.ego_length,
+                "ego_width_m": config.ego_width,
+                "ego_height_m": config.ego_height,
+                "safety_margin_m": config.safety_margin,
+            },
+        },
+        "temporal_robustness": temporal,
+        "urdf": {
+            "urdf_path": result.urdf_path.as_posix() if result.urdf_path else None,
+            "base_frame": result.base_frame,
+            "sensor_frames": sorted({frame.sensor_frame for frame in result.frames if frame.sensor_frame}),
+            "transforms": {
+                key: _matrix_to_list(value)
+                for key, value in sorted(result.sensor_to_base_transforms.items())
+            },
+        },
+        "outputs": {
+            "detections_csv": (result.output_dir / "detections.csv").as_posix(),
+            "evaluation_summary_json": (
+                result.output_dir / "evaluation_summary.json"
+            ).as_posix(),
+            "task1_report_md": (result.output_dir / "task1_report.md").as_posix(),
+            "detection_count_plot": (
+                result.output_dir / "detection_count_over_time.png"
+            ).as_posix(),
+        },
+    }
+    return _json_safe(metrics)
 
 
 def build_evaluation_summary(
@@ -670,7 +1451,10 @@ def build_evaluation_summary(
             "criterion": "Robustness",
             "metric": "frames_processed",
             "value": str(frames_processed),
-            "interpretation": "Limited-frame processing completed without loading the full bag.",
+            "interpretation": (
+                "Frame coverage for this run; --max-frames all removes the old "
+                "20-frame cap."
+            ),
         },
         {
             "criterion": "Robustness",
@@ -744,9 +1528,21 @@ def build_evaluation_summary(
 def _build_report(
     result: PipelineResult,
     evaluation_rows: list[dict[str, str]],
+    evaluation_metrics: dict[str, Any],
+    config: DetectionConfig,
 ) -> str:
+    filters = evaluation_metrics["filters"]
+    temporal = evaluation_metrics["temporal_robustness"]
     lines = [
         "# Task 1 Opponent Vehicle Detection Report",
+        "",
+        "## Method",
+        "",
+        "Task 1 reads standard `sensor_msgs/msg/PointCloud2` messages directly "
+        "from the ROS 2 sqlite bag, transforms LiDAR points into the URDF ego "
+        "frame when a URDF is available, removes ground/self points, clusters "
+        "the BEV points with DBSCAN, and retains clusters with vehicle-like "
+        "support and dimensions.",
         "",
         "## Bag Inspection",
         "",
@@ -765,6 +1561,13 @@ def _build_report(
         lines.append(f"- Message type: `{result.selected_topic.message_type}`")
     lines.append(f"- Frames processed: {len(result.frames)}")
     lines.append(f"- Detections written: {len(result.detections)}")
+    lines.append(f"- URDF path: `{result.urdf_path.as_posix() if result.urdf_path else 'not used'}`")
+    lines.append(f"- Base frame: `{result.base_frame or 'legacy_inferred_bev'}`")
+    lines.append(
+        "- Ego safety box defaults: "
+        f"length={config.ego_length:.2f} m, width={config.ego_width:.2f} m, "
+        f"height={config.ego_height:.2f} m, margin={config.safety_margin:.2f} m"
+    )
 
     if result.axis_mapping:
         lines.append(
@@ -774,6 +1577,52 @@ def _build_report(
             f"vertical=`{result.axis_mapping.vertical or 'none'}`"
         )
         lines.append(f"- Axis mapping reason: {result.axis_mapping.reason}")
+
+    if result.sensor_to_base_transforms:
+        lines.extend(["", "## URDF Use", ""])
+        lines.append(
+            "The URDF provides the fixed transform from the LiDAR frame into the "
+            "ego/base frame. BEV boxes are reported in that base frame using "
+            "`center_x_base`, `center_y_base`, and base-frame min/max columns."
+        )
+        for key, transform in sorted(result.sensor_to_base_transforms.items()):
+            t = transform[:3, 3]
+            lines.append(
+                f"- `{key}` translation: [{t[0]:.3f}, {t[1]:.3f}, {t[2]:.3f}] m"
+            )
+
+    lines.extend(
+        [
+            "",
+            "## Filter Evidence",
+            "",
+            f"- Raw DBSCAN clusters before filters: {filters['raw_clusters_before_filters']}",
+            f"- Clusters after ground filter: {filters['clusters_after_ground_filter']}",
+            f"- Clusters after ego/self filter: {filters['clusters_after_ego_filter']}",
+            f"- Final detections after all filters: {filters['final_detections_after_all_filters']}",
+            "- Overall raw-cluster to final-detection reduction: "
+            f"{filters['overall_cluster_to_detection_reduction_percent']:.2f}%",
+            f"- Ground-filter point rejects: {filters['ground_filter_points_rejected']}",
+            f"- Ego/self point rejects: {filters['ego_self_points_rejected']}",
+            "- Vehicle-size rejected clusters: "
+            f"{filters['vehicle_size_filter_rejected_clusters']}",
+            "- Point-count rejected clusters: "
+            f"{filters['point_count_filter_rejected_clusters']}",
+        ]
+    )
+
+    lines.extend(
+        [
+            "",
+            "## Temporal Robustness",
+            "",
+            "- Detection counts are tracked for every processed frame and plotted in "
+            "`detection_count_over_time.png`.",
+            "- Sudden jumps/dropouts detected: "
+            f"{len(temporal['sudden_jumps_or_dropouts'])}",
+            f"- Zero-detection frames: {temporal['zero_detection_frames']}",
+        ]
+    )
 
     lines.extend(
         [
@@ -810,13 +1659,21 @@ def _build_report(
             "",
             f"- CSV: `{(result.output_dir / 'detections.csv').as_posix()}`",
             f"- Evaluation summary: `{(result.output_dir / 'evaluation_summary.csv').as_posix()}`",
+            f"- Evaluation JSON: `{(result.output_dir / 'evaluation_summary.json').as_posix()}`",
+            f"- Detection-count plot: `{(result.output_dir / 'detection_count_over_time.png').as_posix()}`",
             f"- BEV plots: `{(result.output_dir / 'frame_*.png').as_posix()}`",
+            f"- Representative BEV plots: `{(result.output_dir / 'representative_frame_*_*.png').as_posix()}`",
+            "",
+            "## Reproduce",
+            "",
+            "```powershell",
+            "uv run python src/task1_detection.py --bag-path data --urdf-path data/eva.urdf --output-dir outputs/task1 --max-frames all",
+            "```",
             "",
             "## Current Limitations",
             "",
             "- This first-pass detector processes one PointCloud2 topic at a time.",
-            "- Sensor extrinsic calibration and multi-LiDAR fusion are not applied yet.",
-            "- Label-based accuracy scoring needs ground-truth opponent positions or boxes.",
+            "- Label-based accuracy scoring needs ground-truth opponent positions or boxes; no precision, recall, or IoU is reported here.",
             "- Cluster boxes are axis-aligned in BEV and are intended as candidates for evaluation and tuning.",
             "- If a future bag uses custom point cloud message types, add their definitions to the deserializer or implement a topic-specific parser.",
         ]
@@ -826,6 +1683,244 @@ def _build_report(
 
 def _markdown_cell(value: str) -> str:
     return str(value).replace("|", "\\|").replace("\n", " ")
+
+
+def _sum_frame_stats(stats_iter: Iterable[dict[str, Any]]) -> dict[str, float]:
+    totals: dict[str, float] = {}
+    for stats in stats_iter:
+        for key, value in stats.items():
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float)) and value is not None and np.isfinite(value):
+                totals[key] = totals.get(key, 0.0) + float(value)
+    return totals
+
+
+def _flatten_stat_lists(frames: list[FrameResult], key: str) -> list[float]:
+    values: list[float] = []
+    for frame in frames:
+        item = frame.cluster_stats.get(key, [])
+        if isinstance(item, list):
+            values.extend(float(value) for value in item)
+    return values
+
+
+def _numeric_stats(values: Iterable[float | int]) -> dict[str, Any]:
+    data = np.asarray(list(values), dtype=np.float64)
+    data = data[np.isfinite(data)]
+    if len(data) == 0:
+        return {
+            "count": 0,
+            "min": None,
+            "max": None,
+            "mean": None,
+            "median": None,
+            "std": None,
+            "p05": None,
+            "p95": None,
+        }
+    return {
+        "count": int(len(data)),
+        "min": float(np.min(data)),
+        "max": float(np.max(data)),
+        "mean": float(np.mean(data)),
+        "median": float(np.median(data)),
+        "std": float(np.std(data)),
+        "p05": float(np.percentile(data, 5)),
+        "p95": float(np.percentile(data, 95)),
+    }
+
+
+def _series_stats(dataframe: pd.DataFrame, column: str) -> dict[str, Any]:
+    if dataframe.empty or column not in dataframe.columns:
+        return _numeric_stats([])
+    return _numeric_stats(dataframe[column].astype(float).tolist())
+
+
+def _percent(numerator: int | float, denominator: int | float) -> float:
+    if denominator <= 0:
+        return 0.0
+    return round(float(numerator) * 100.0 / float(denominator), 2)
+
+
+def _temporal_robustness_metrics(counts: list[int]) -> dict[str, Any]:
+    if not counts:
+        return {
+            "sudden_change_threshold": 0,
+            "sudden_jumps_or_dropouts": [],
+            "zero_detection_frames": 0,
+        }
+    deltas = np.diff(np.asarray(counts, dtype=np.float64))
+    if len(deltas) == 0:
+        threshold = 1
+    else:
+        abs_deltas = np.abs(deltas)
+        threshold = int(max(3, math.ceil(float(abs_deltas.mean() + 2.0 * abs_deltas.std()))))
+
+    events: list[dict[str, Any]] = []
+    for index, delta in enumerate(deltas, start=1):
+        previous_count = counts[index - 1]
+        current_count = counts[index]
+        is_dropout = previous_count > 0 and current_count == 0
+        if abs(delta) >= threshold or is_dropout:
+            events.append(
+                {
+                    "frame_idx": index,
+                    "previous_count": int(previous_count),
+                    "current_count": int(current_count),
+                    "delta": int(delta),
+                    "dropout_to_zero": bool(is_dropout),
+                }
+            )
+    return {
+        "detection_counts": [int(value) for value in counts],
+        "detection_count_delta_stats": _numeric_stats(deltas.tolist() if len(deltas) else []),
+        "sudden_change_threshold": threshold,
+        "sudden_jumps_or_dropouts": events,
+        "zero_detection_frames": int(sum(count == 0 for count in counts)),
+    }
+
+
+def _matrix_to_list(matrix: np.ndarray) -> list[list[float]]:
+    return [[float(value) for value in row] for row in np.asarray(matrix)]
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, tuple):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
+def _plot_detection_count_over_time(
+    frames: list[FrameResult],
+    output_path: str | Path,
+) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    frame_indices = [frame.frame_index for frame in frames]
+    counts = [len(frame.detections) for frame in frames]
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(frame_indices, counts, color="#1f77b4", linewidth=1.8, marker="o", markersize=2.5)
+    ax.set_title("Task 1 detection count over time")
+    ax.set_xlabel("frame index")
+    ax.set_ylabel("detections")
+    ax.grid(True, color="#d8d8d8", linewidth=0.7)
+    fig.tight_layout()
+    fig.savefig(output, dpi=160)
+    plt.close(fig)
+
+
+def _write_representative_bev_plots(
+    result: PipelineResult,
+    config: DetectionConfig,
+) -> None:
+    for frame in _representative_frames(result.frames):
+        prefix = result.output_dir / f"representative_frame_{frame.frame_index:03d}"
+        plot_bev_frame(
+            frame.raw_bev_points,
+            [],
+            f"{prefix}_raw.png",
+            title=f"Task 1 raw URDF-base points | frame {frame.frame_index:03d}",
+            forward_range=config.forward_range,
+            lateral_range=config.lateral_range,
+        )
+        plot_bev_frame(
+            frame.after_ego_bev_points,
+            [],
+            f"{prefix}_after_ego.png",
+            title=f"Task 1 after ground + ego filtering | frame {frame.frame_index:03d}",
+            forward_range=config.forward_range,
+            lateral_range=config.lateral_range,
+        )
+        plot_bev_frame(
+            frame.bev_points,
+            frame.detections,
+            f"{prefix}_final.png",
+            title=f"Task 1 final clusters/detections | frame {frame.frame_index:03d}",
+            forward_range=config.forward_range,
+            lateral_range=config.lateral_range,
+        )
+
+
+def _representative_frames(frames: list[FrameResult]) -> list[FrameResult]:
+    if not frames:
+        return []
+    counts = np.asarray([len(frame.detections) for frame in frames], dtype=np.float64)
+    candidate_indices = {
+        0,
+        len(frames) - 1,
+        int(np.argmax(counts)),
+        int(np.argmin(np.abs(counts - np.median(counts)))),
+    }
+    return [frames[index] for index in sorted(candidate_indices)]
+
+
+def _canonical_frame_name(frame_name: str | None) -> str:
+    return str(frame_name or "").strip().strip("/")
+
+
+def _parse_float_triplet(text: str) -> tuple[float, float, float]:
+    parts = [float(item) for item in str(text).replace(",", " ").split()]
+    if len(parts) != 3:
+        raise ValueError(f"Expected three float values in URDF origin, got {text!r}")
+    return parts[0], parts[1], parts[2]
+
+
+def _homogeneous_from_xyz_rpy(
+    xyz: tuple[float, float, float],
+    rpy: tuple[float, float, float],
+) -> np.ndarray:
+    roll, pitch, yaw = rpy
+    cr, sr = math.cos(roll), math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    rx = np.array(
+        [[1.0, 0.0, 0.0], [0.0, cr, -sr], [0.0, sr, cr]],
+        dtype=np.float64,
+    )
+    ry = np.array(
+        [[cp, 0.0, sp], [0.0, 1.0, 0.0], [-sp, 0.0, cp]],
+        dtype=np.float64,
+    )
+    rz = np.array(
+        [[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, :3] = rz @ ry @ rx
+    transform[:3, 3] = np.asarray(xyz, dtype=np.float64)
+    return transform
+
+
+def _spatial_mask(points_xyz: np.ndarray, config: DetectionConfig) -> np.ndarray:
+    if len(points_xyz) == 0:
+        return np.zeros(0, dtype=bool)
+    return (
+        (points_xyz[:, 0] >= config.forward_range[0])
+        & (points_xyz[:, 0] <= config.forward_range[1])
+        & (points_xyz[:, 1] >= config.lateral_range[0])
+        & (points_xyz[:, 1] <= config.lateral_range[1])
+    )
+
+
+def _bev_from_points(points_xyz: np.ndarray) -> np.ndarray:
+    if len(points_xyz) == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    return points_xyz[:, :2].astype(np.float32, copy=False)
 
 
 def _axis_spread(values: np.ndarray) -> float:
@@ -873,3 +1968,115 @@ _POINT_FIELD_DTYPES = {
     7: "f4",  # FLOAT32
     8: "f8",  # FLOAT64
 }
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run Task 1 opponent vehicle detection on ROS 2 bag point clouds."
+    )
+    parser.add_argument(
+        "--bag-path",
+        "--bag-dir",
+        dest="bag_dir",
+        default="data",
+        help="Directory containing metadata.yaml and ROS 2 sqlite3 bag files.",
+    )
+    parser.add_argument(
+        "--urdf-path",
+        default=None,
+        help="Vehicle URDF used to transform sensor points into the ego/base frame.",
+    )
+    parser.add_argument(
+        "--base-frame",
+        default=None,
+        help="URDF base/ego frame. Defaults to base_link, ego, or center_of_gravity.",
+    )
+    parser.add_argument(
+        "--allow-identity-transform",
+        action="store_true",
+        help="Debug fallback only: use identity if the URDF sensor transform is missing.",
+    )
+    parser.add_argument(
+        "--max-frames",
+        type=parse_max_frames_arg,
+        default=DEFAULT_MAX_FRAMES,
+        help="Maximum point cloud frames to process, or 'all' for no limit.",
+    )
+    parser.add_argument(
+        "--debug-max-frames",
+        type=int,
+        default=None,
+        help="Quick-test frame cap that overrides --max-frames when provided.",
+    )
+    parser.add_argument(
+        "--max-plots",
+        type=int,
+        default=DEFAULT_MAX_PLOTS,
+        help="Maximum number of per-frame BEV plots to write.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default="outputs/task1",
+        help="Directory for detections, metrics, reports, and visualizations.",
+    )
+    parser.add_argument(
+        "--topic",
+        default=None,
+        help="Optional PointCloud2 topic to process. If omitted, front LiDAR is preferred.",
+    )
+    parser.add_argument(
+        "--inspect-only",
+        action="store_true",
+        help="Only print bag metadata summary and exit.",
+    )
+    parser.add_argument(
+        "--no-ground-filter",
+        action="store_true",
+        help="Disable ground-plane filtering.",
+    )
+    parser.add_argument("--ego-length", type=float, default=5.0)
+    parser.add_argument("--ego-width", type=float, default=2.2)
+    parser.add_argument("--ego-height", type=float, default=1.6)
+    parser.add_argument("--safety-margin", type=float, default=0.25)
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
+    summary = parse_bag_summary(args.bag_dir)
+    print(format_bag_summary(summary))
+
+    if args.inspect_only:
+        return
+
+    effective_max_frames = (
+        args.debug_max_frames if args.debug_max_frames is not None else args.max_frames
+    )
+    result = run_task1_pipeline(
+        args.bag_dir,
+        max_frames=effective_max_frames,
+        max_plots=args.max_plots,
+        output_dir=args.output_dir,
+        topic_name=args.topic,
+        ground_filter=not args.no_ground_filter,
+        urdf_path=args.urdf_path,
+        base_frame=args.base_frame,
+        allow_identity_transform=args.allow_identity_transform,
+        ego_length=args.ego_length,
+        ego_width=args.ego_width,
+        ego_height=args.ego_height,
+        safety_margin=args.safety_margin,
+    )
+
+    print("")
+    print("Task 1 pipeline complete")
+    print(f"- selected topic: {result.selected_topic.name if result.selected_topic else 'none'}")
+    print(f"- frames processed: {len(result.frames)}")
+    print(f"- detections: {len(result.detections)}")
+    print(f"- outputs: {Path(args.output_dir)}")
+    for diagnostic in result.diagnostics:
+        print(f"- diagnostic: {diagnostic}")
+
+
+if __name__ == "__main__":
+    main()

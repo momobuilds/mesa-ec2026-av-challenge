@@ -2,17 +2,24 @@
 
 ## Task 1: Opponent Vehicle Detection
 
-This repository includes a first-pass Task 1 pipeline that inspects the ROS 2
-bag metadata, reads a limited number of standard `sensor_msgs/msg/PointCloud2`
-messages directly from the sqlite3 `.db3` files, clusters BEV points with
-DBSCAN, and writes candidate opponent detections.
+This repository includes a Task 1 pipeline that inspects the ROS 2 bag metadata,
+reads standard `sensor_msgs/msg/PointCloud2` messages directly from the sqlite3
+`.db3` files, uses the provided vehicle URDF to transform LiDAR points into the
+ego/base frame, clusters BEV points with DBSCAN, and writes candidate opponent
+detections plus label-free evaluation evidence.
 
 The code is designed to run without a full ROS 2 installation.
 
 ### Task 1 — Run
 
 ```powershell
-uv run python scripts/run_task1.py --bag-dir data --max-frames 20 --output-dir outputs/task1
+uv run python src/task1_detection.py --bag-path data --urdf-path data/eva.urdf --output-dir outputs/task1 --max-frames all
+```
+
+For a quick debug run without processing the full bag:
+
+```powershell
+uv run python scripts/run_task1.py --bag-dir data --urdf-path data/eva.urdf --debug-max-frames 20 --output-dir outputs/task1_debug
 ```
 
 To inspect the bag without running detection:
@@ -24,7 +31,7 @@ uv run python scripts/run_task1.py --bag-dir data --inspect-only
 To force a specific point cloud topic:
 
 ```powershell
-uv run python scripts/run_task1.py --bag-dir data --topic /sensor/radar_front/points --max-frames 20 --output-dir outputs/task1
+uv run python scripts/run_task1.py --bag-dir data --urdf-path data/eva.urdf --topic /sensor/lidar_front/points --debug-max-frames 20 --output-dir outputs/task1_debug
 ```
 
 ### Task 1 — Outputs
@@ -33,21 +40,39 @@ The default run writes:
 
 - `outputs/task1/detections.csv`
 - `outputs/task1/evaluation_summary.csv`
+- `outputs/task1/evaluation_summary.json`
+- `outputs/task1/detection_count_over_time.png`
 - `outputs/task1/frame_000.png`, `frame_001.png`, ...
+- `outputs/task1/representative_frame_000_raw.png`, `_after_ego.png`, `_final.png`
 - `outputs/task1/task1_report.md`
 
 The CSV columns include timestamp, detection id, BEV center position, axis-aligned
-bounding box limits, dimensions, point count, and a simple confidence score.
+bounding box limits, dimensions, point count, a simple confidence score, and
+base-frame fields such as `sensor_frame`, `base_frame`, `center_x_base`,
+`center_y_base`, and base-frame min/max box limits.
 
 The evaluation summary maps the generated outputs to the challenge criteria:
-accuracy, robustness, and false positive reduction. True precision/recall,
-position error, and IoU require ground-truth opponent annotations; until those
-are available, the report includes proxy run metrics and the filtering checks
-used to control false positives.
+accuracy, robustness, false positive reduction, and frame coverage. Because the
+project still has no labelled opponent annotations, true precision/recall,
+position error, and IoU are not reported. Instead, the JSON and markdown report
+include total frames processed, detections-per-frame statistics, frames with
+detections, DBSCAN cluster size statistics, bounding-box size statistics,
+filter rejection counts/percentages for ground, ego/self, vehicle-size, and
+point-count filters, before/after false-positive reduction evidence, sudden
+jump/dropout checks, and the detection-count time plot.
 
 ### Task 1 — Notes
 
 - The default topic is `/sensor/lidar_front/points` when available.
+- `--max-frames all` processes all available LiDAR frames. Use
+  `--debug-max-frames N` for fast checks.
+- URDF transforms are required for geometry-backed Task 1 evidence. If a sensor
+  frame cannot be resolved, the script fails clearly unless
+  `--allow-identity-transform` is passed for debugging.
+- The URDF references the ego mesh but does not provide exact mesh dimensions,
+  so the self filter uses configurable defaults:
+  `ego_length=5.0 m`, `ego_width=2.2 m`, `ego_height=1.6 m`,
+  `safety_margin=0.25 m`.
 - Ground-plane filtering is on by default; disable with `--no-ground-filter`.
 - If a future bag uses custom message types, add a parser for the topic/message
   type listed in `outputs/task1/task1_report.md`.
