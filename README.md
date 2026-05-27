@@ -60,14 +60,25 @@ Extends Task 1 across all 7 PointCloud2 sensors (3 LiDARs + 4 radars) with:
 
 - Ego-frame coordinate unification via hardcoded sensor extrinsics
 - Oriented minimum-area bounding boxes (Shapely)
-- Radar Doppler velocity extraction with ego-motion correction
-- EKF + Hungarian-matching fusion (master clock: lidar_front)
-- BEV plots and fused detections CSV
+- Radar Doppler velocity extraction when spatial association is plausible
+- Projection-based camera validation using compressed camera images
+- Lightweight temporal filtering with `track_id`, velocity, heading, and short-gap prediction
+- BEV plots, camera/lidar verification images, and fused detections CSV
 
 ### Task 2 — Run
 
+Quick validation run:
+
 ```bash
-uv run python scripts/run_task2.py --bag-dir data --max-frames 20 --output-dir outputs/task2
+uv run python scripts/run_task2.py --bag-dir data --max-frames 20 --bev-frames 5 --output-dir outputs/task2
+python3 scripts/validate_task2_outputs.py --output-dir outputs/task2
+```
+
+Full available-frame run for submission artifacts:
+
+```bash
+uv run python scripts/run_task2.py --bag-dir data --max-frames 4800 --bev-frames 20 --output-dir outputs/task2
+python3 scripts/validate_task2_outputs.py --output-dir outputs/task2
 ```
 
 To inspect the bag without running detection:
@@ -86,11 +97,14 @@ uv run python scripts/run_task2.py --sensors /sensor/lidar_front/points /sensor/
 
 - `outputs/task2/fused_detections.csv` — one row per fused detection per master timestamp
 - `outputs/task2/fusion_bev_NNN.png` — BEV plots (raw points + oriented boxes + velocity arrows)
+- `outputs/task2/verify_lidar_overlay_000.png` — regenerated LiDAR/frame-level verification view
+- `outputs/task2/verify_camera_projection_000.png` — regenerated camera projection verification view
 - `outputs/task2/task2_report.md` — full assumptions, limitations, and results
 
 ### Task 2 — Notes
 
 - Sensor extrinsics are hardcoded approximations (no calibration data in bag).
+- Camera support is projection/timestamp validation, not a learned image detector.
 - lidar_left and lidar_right see track barriers only; they produce no vehicle detections.
 - Radar detections at >10 m lateral are barrier reflections; they fall outside the
   Mahalanobis association gate and are correctly excluded from fused output.
