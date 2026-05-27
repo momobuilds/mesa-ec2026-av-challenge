@@ -1,0 +1,2 @@
+model_type,number_of_training_samples,number_of_features,pseudo_label_type,train_score,validation_score,fallback_reason,top_features
+RandomForestRegressor,1773,15,normalized deterministic risk score,0.9933859309657876,0.9870013858173272,,collision_risk_score:0.853; progress_reward:0.061; behaviour_uncertainty_score:0.059; min_predicted_distance:0.011; racing_line_cost:0.007; opponent_behaviour_code:0.006; smoothness_cost:0.002; time_to_closest_approach:0.001

@@ -1,0 +1,20 @@
+metric,strategy,value,percentage,notes
+number_of_planning_frames,,197,,
+mean_safety_margin,,4.147662712435047,,m
+minimum_safety_margin,,-4.910300743460708,,m
+number_of_unsafe_frames,,19,,
+number_of_overtaking_attempts,,21,,
+number_of_aborted_overtakes,,4,,
+number_of_emergency_brakes,,31,,
+learning_based_model_used,,True,,RandomForestRegressor
+notes_about_missing_inputs,,,,tracks: loaded 2752 rows from outputs\task3\tracks.csv | predictions: loaded 9000 rows from outputs\task5\predictions.csv | predictions: Task 5 future positions used where source timestamps match | behaviour: loaded 2752 rows from outputs\task6\behaviour_predictions.csv | map: loaded 12 GeoJSON boundary polylines for context | corridor: half_width=9.00 m (inferred from Task 3 lateral track spread with Task 4 boundaries for visual context) | ego: loaded ego.mat velocity log with 45131 samples
+selected_strategy_count,follow_opponent,76,38.578680203045685,
+selected_strategy_count,keep_racing_line,41,20.81218274111675,
+selected_strategy_count,emergency_brake,31,15.736040609137056,
+selected_strategy_count,overtake_right,14,7.106598984771574,
+selected_strategy_count,evasive_right,13,6.598984771573604,
+selected_strategy_count,overtake_left,7,3.553299492385787,
+selected_strategy_count,brake,6,3.045685279187817,
+selected_strategy_count,evasive_left,5,2.5380710659898478,
+selected_strategy_count,abort_overtake,4,2.030456852791878,
+unsafe_candidate_fraction,,0.3745064861816131,,candidate-level
