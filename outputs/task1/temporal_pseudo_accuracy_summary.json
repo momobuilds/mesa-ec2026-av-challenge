@@ -1,0 +1,16 @@
+{
+  "confirmed_tracks": 66,
+  "detections_on_confirmed_tracks": 542,
+  "distance_gate_m": 6.0,
+  "ground_truth_available": false,
+  "important_note": "This is not labelled accuracy. It estimates reliability by measuring what fraction of Task 1 detections persist in short temporal tracks.",
+  "max_gap_frames": 2,
+  "mean_confirmed_track_hits": 8.212121212121213,
+  "median_confirmed_track_hits": 6.0,
+  "metric_type": "temporal_self_consistency_pseudo_accuracy",
+  "min_confirmed_hits": 3,
+  "one_frame_tracks": 51,
+  "temporal_pseudo_precision": 0.8429,
+  "temporal_tracks_total": 142,
+  "total_detections": 643
+}

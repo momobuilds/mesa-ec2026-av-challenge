@@ -1,0 +1,18 @@
+{
+  "detections_evaluated": 379,
+  "distance_gate_m": 5.0,
+  "ground_truth_available": false,
+  "important_note": "These are pseudo metrics using Task 3 confirmed tracks as reference. They are not labelled benchmark accuracy and must not be reported as true precision/recall/IoU.",
+  "matched_pairs": 2,
+  "mean_axis_aligned_iou": 0.0,
+  "mean_center_error_m": 3.739014836840796,
+  "median_axis_aligned_iou": 0.0,
+  "median_center_error_m": 3.739014836840796,
+  "metric_type": "pseudo_accuracy_against_task3_tracks",
+  "pseudo_precision": 0.0053,
+  "pseudo_recall": 0.0048,
+  "pseudo_tracks_evaluated": 419,
+  "timestamp_tolerance_ms": 60.0,
+  "unmatched_detections": 377,
+  "unmatched_pseudo_tracks": 417
+}

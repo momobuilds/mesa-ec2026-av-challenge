@@ -61,6 +61,17 @@ filter rejection counts/percentages for ground, ego/self, vehicle-size, and
 point-count filters, before/after false-positive reduction evidence, sudden
 jump/dropout checks, and the detection-count time plot.
 
+For an additional honest pseudo-accuracy estimate, compare Task 1 detections
+with temporal references:
+
+```powershell
+uv run python src/task1_pseudo_eval.py --detections outputs/task1/detections.csv --tracks outputs/task3/tracks.csv --output-dir outputs/task1
+```
+
+This writes `pseudo_accuracy_summary.json` using Task 3 confirmed tracks as a
+pseudo-reference and `temporal_pseudo_accuracy_summary.json` using Task 1
+temporal self-consistency. These are not labelled accuracy numbers.
+
 ### Task 1 — Notes
 
 - The default topic is `/sensor/lidar_front/points` when available.
