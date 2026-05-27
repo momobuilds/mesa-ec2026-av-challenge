@@ -15,6 +15,7 @@ from pathlib import Path
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.patches import Patch, Rectangle
 import numpy as np
 
 from src.ego_trajectory import EgoTrajectory
@@ -27,6 +28,20 @@ def _log_odds_to_uint8(log_odds: np.ndarray) -> np.ndarray:
     """Convert log-odds array to uint8: 0=occupied, 128=unknown, 255=free."""
     prob = 1.0 / (1.0 + np.exp(-log_odds.astype(np.float32)))
     return ((1.0 - prob) * 255.0).astype(np.uint8)
+
+
+def _log_odds_to_semantic_rgb(log_odds: np.ndarray) -> np.ndarray:
+    """Convert log-odds to RGB colors for presentation-ready animation."""
+    rgb = np.empty((*log_odds.shape, 3), dtype=np.uint8)
+    rgb[:, :] = (99, 109, 121)  # unknown: slate grey
+
+    free_thresh = math.log(0.3 / 0.7)
+    free_mask = log_odds < free_thresh
+    occ_mask = log_odds > 0.0
+
+    rgb[free_mask] = (49, 185, 107)  # free: green
+    rgb[occ_mask] = (8, 11, 16)      # occupied: near black
+    return rgb
 
 
 def _grid_extent(grid: ProbabilisticGrid) -> list[float]:
@@ -51,6 +66,47 @@ def _draw_oriented_box(
     pts = (R @ corners.T).T + np.array([cx, cy])
     ax.plot(pts[:, 0], pts[:, 1], "r-", lw=1.5)
     ax.text(cx, cy, str(track_id), fontsize=6, color="red", ha="center", va="center")
+
+
+def _animation_view_extent(
+    grid: ProbabilisticGrid,
+    ego_poses: list[tuple[float, float]],
+    margin_m: float = 85.0,
+) -> list[float]:
+    """Square view focused on the driven segment, clamped to the grid extent."""
+    full = _grid_extent(grid)
+    if not ego_poses:
+        return full
+
+    xs = np.array([p[0] for p in ego_poses], dtype=np.float64)
+    ys = np.array([p[1] for p in ego_poses], dtype=np.float64)
+    cx = float((xs.min() + xs.max()) / 2.0)
+    cy = float((ys.min() + ys.max()) / 2.0)
+    half = max(float(xs.max() - xs.min()), float(ys.max() - ys.min())) / 2.0
+    half = max(half + margin_m, 70.0)
+
+    x0, x1 = cx - half, cx + half
+    y0, y1 = cy - half, cy + half
+    dx = max(0.0, full[0] - x0) - max(0.0, x1 - full[1])
+    dy = max(0.0, full[2] - y0) - max(0.0, y1 - full[3])
+    x0 += dx
+    x1 += dx
+    y0 += dy
+    y1 += dy
+    return [max(full[0], x0), min(full[1], x1), max(full[2], y0), min(full[3], y1)]
+
+
+def _canvas_rgb(fig: plt.Figure) -> np.ndarray:
+    """Read a Matplotlib canvas into an RGB array across Matplotlib versions."""
+    fig.canvas.draw()
+    try:
+        buf = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+        w, h = fig.canvas.get_width_height()
+        return buf.reshape(h, w, 3)
+    except AttributeError:
+        buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+        w, h = fig.canvas.get_width_height()
+        return buf.reshape(h, w, 4)[:, :, :3]
 
 
 # ── public functions ──────────────────────────────────────────────────────────
@@ -257,35 +313,66 @@ def render_animation(
 
     frames_pil: list[Image.Image] = []
     extent = _grid_extent(grid)
+    view_extent = _animation_view_extent(grid, ego_poses)
+    n_frames = min(len(grid_snapshots), len(ego_poses))
+
+    legend_handles = [
+        Patch(facecolor="#31B96B", edgecolor="none", label="free"),
+        Patch(facecolor="#080B10", edgecolor="#7C8590", label="occupied"),
+        Patch(facecolor="#636D79", edgecolor="none", label="unknown"),
+        Patch(facecolor="#38BDF8", edgecolor="none", label="ego path"),
+    ]
 
     for i, (log_odds, (x_ego, y_ego)) in enumerate(zip(grid_snapshots, ego_poses)):
-        img_arr = np.flipud(_log_odds_to_uint8(log_odds))
+        img_arr = np.flipud(_log_odds_to_semantic_rgb(log_odds))
 
-        fig, ax = plt.subplots(figsize=(6, 6))
-        ax.imshow(img_arr, cmap="gray", vmin=0, vmax=255,
-                  extent=extent, origin="lower")
-        # Fading trail of last 20 poses
-        trail_x = [p[0] for p in ego_poses[max(0, i - 20): i + 1]]
-        trail_y = [p[1] for p in ego_poses[max(0, i - 20): i + 1]]
+        fig, ax = plt.subplots(figsize=(7, 7), facecolor="#0B1020")
+        ax.set_facecolor("#0B1020")
+        ax.imshow(img_arr, extent=extent, origin="lower", interpolation="nearest")
+
+        trail_x = [p[0] for p in ego_poses[: i + 1]]
+        trail_y = [p[1] for p in ego_poses[: i + 1]]
         if trail_x:
-            ax.plot(trail_x, trail_y, "b-", lw=0.8, alpha=0.5)
-        ax.plot(x_ego, y_ego, "go", ms=7)
-        ax.set_title(f"Frame {i + 1}/{len(grid_snapshots)}", fontsize=9)
+            ax.plot(trail_x, trail_y, color="#38BDF8", lw=2.0, alpha=0.9)
+            ax.plot(trail_x[0], trail_y[0], marker="o", ms=6,
+                    color="#FACC15", mec="#111827", mew=0.8)
+        ax.plot(x_ego, y_ego, marker="o", ms=9, color="#F8FAFC",
+                mec="#22C55E", mew=2.0)
+
+        ax.set_xlim(view_extent[0], view_extent[1])
+        ax.set_ylim(view_extent[2], view_extent[3])
         ax.set_aspect("equal")
         ax.axis("off")
-        plt.tight_layout(pad=0.5)
 
-        fig.canvas.draw()
-        # tostring_rgb was removed in matplotlib 3.8; use buffer_rgba instead
-        try:
-            buf = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-            w, h = fig.canvas.get_width_height()
-            rgb = buf.reshape(h, w, 3)
-        except AttributeError:
-            buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
-            w, h = fig.canvas.get_width_height()
-            rgba = buf.reshape(h, w, 4)
-            rgb = rgba[:, :, :3]
+        title = f"Task 4 - Occupancy Map  |  Frame {i + 1}/{n_frames}"
+        ax.text(0.02, 0.97, title, transform=ax.transAxes, ha="left", va="top",
+                color="#F8FAFC", fontsize=11, fontweight="bold")
+        ax.text(0.02, 0.925, "LiDAR log-odds map filling as ego drives",
+                transform=ax.transAxes, ha="left", va="top",
+                color="#CBD5E1", fontsize=8)
+
+        progress = (i + 1) / max(n_frames, 1)
+        ax.add_patch(Rectangle((0.02, 0.035), 0.38, 0.014,
+                               transform=ax.transAxes, color="#1E293B",
+                               zorder=5, clip_on=False))
+        ax.add_patch(Rectangle((0.02, 0.035), 0.38 * progress, 0.014,
+                               transform=ax.transAxes, color="#38BDF8",
+                               zorder=6, clip_on=False))
+
+        x0 = view_extent[0] + 0.06 * (view_extent[1] - view_extent[0])
+        y0 = view_extent[2] + 0.08 * (view_extent[3] - view_extent[2])
+        scale_len = 50.0 if (view_extent[1] - view_extent[0]) > 180 else 25.0
+        ax.plot([x0, x0 + scale_len], [y0, y0], color="#F8FAFC", lw=3)
+        ax.text(x0 + scale_len / 2.0, y0 + 3.0, f"{int(scale_len)} m",
+                color="#F8FAFC", fontsize=8, ha="center")
+
+        leg = ax.legend(handles=legend_handles, loc="lower right", fontsize=7,
+                        frameon=True, facecolor="#0F172A", edgecolor="#334155",
+                        labelcolor="#E2E8F0", ncol=2)
+        leg.get_frame().set_alpha(0.88)
+
+        plt.tight_layout(pad=0.15)
+        rgb = _canvas_rgb(fig)
         frames_pil.append(Image.fromarray(rgb))
         plt.close(fig)
 
@@ -295,6 +382,6 @@ def render_animation(
             save_all=True,
             append_images=frames_pil[1:],
             loop=0,
-            duration=250,   # ms per frame
+            duration=180,   # ms per frame
             optimize=True,
         )
