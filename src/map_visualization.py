@@ -55,6 +55,67 @@ def _draw_oriented_box(
 
 # ── public functions ──────────────────────────────────────────────────────────
 
+def render_freespace_map(
+    grid: ProbabilisticGrid,
+    boundaries: list[np.ndarray],
+    output_path: str,
+) -> None:
+    """Save a color-coded freespace map for visualisation clarity.
+
+    Color scheme (evaluation-friendly):
+      - Black  (RGB 0,0,0)      : Occupied  — barriers / walls
+      - Green  (RGB 64,180,64)  : Free space — confirmed navigable area
+      - Grey   (RGB 160,160,160): Unknown   — not yet observed
+    Track boundary polylines are drawn in bright yellow for contrast.
+    """
+    lo = grid._log_odds  # (H, W) float32
+    H, W = lo.shape
+
+    # Build RGB image
+    rgb = np.full((H, W, 3), 160, dtype=np.uint8)   # default: unknown grey
+
+    free_thresh = math.log(0.3 / 0.7)    # l < this → free (P<0.3)
+    occ_thresh  = math.log(0.5 / 0.5)   # l > this → occupied (P>0.5)
+
+    free_mask = lo < free_thresh
+    occ_mask  = lo > occ_thresh
+
+    # Free: green
+    rgb[free_mask, 0] = 64
+    rgb[free_mask, 1] = 180
+    rgb[free_mask, 2] = 64
+    # Occupied: black
+    rgb[occ_mask,  :] = 0
+
+    # Flip so y increases upward
+    img = np.flipud(rgb)
+
+    extent = _grid_extent(grid)
+    fig, ax = plt.subplots(figsize=(12, 12))
+    ax.imshow(img, extent=extent, origin="lower", interpolation="nearest")
+
+    for i, b in enumerate(boundaries):
+        ax.plot(b[:, 0], b[:, 1], color="#FFD700", lw=1.5, alpha=0.9,
+                label="track boundary" if i == 0 else "")
+    if boundaries:
+        ax.legend(fontsize=9)
+
+    ax.set_xlabel("x_world (m)")
+    ax.set_ylabel("y_world (m)")
+    ax.set_title("Task 4 — Free-space map  (green=free, black=occupied, grey=unknown)")
+    ax.set_aspect("equal")
+
+    # Scale bar (50 m)
+    x0 = extent[0] + 0.05 * (extent[1] - extent[0])
+    y0 = extent[2] + 0.04 * (extent[3] - extent[2])
+    ax.plot([x0, x0 + 50], [y0, y0], "w-", lw=3)
+    ax.text(x0 + 25, y0 + 2, "50 m", color="white", fontsize=8, ha="center")
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    plt.close(fig)
+
+
 def render_world_map_static(
     grid: ProbabilisticGrid,
     boundaries: list[np.ndarray],
@@ -62,18 +123,23 @@ def render_world_map_static(
 ) -> None:
     """Save final occupancy grid with boundary polylines overlaid (red)."""
     img = np.flipud(grid.render())  # flip so y increases upward
+    extent = _grid_extent(grid)
     fig, ax = plt.subplots(figsize=(12, 12))
-    ax.imshow(img, cmap="gray", vmin=0, vmax=255,
-              extent=_grid_extent(grid), origin="lower")
+    ax.imshow(img, cmap="gray", vmin=0, vmax=255, extent=extent, origin="lower")
     for i, b in enumerate(boundaries):
-        ax.plot(b[:, 0], b[:, 1], "r-", lw=1.0, alpha=0.8,
-                label="boundary" if i == 0 else "")
+        ax.plot(b[:, 0], b[:, 1], "r-", lw=1.5, alpha=0.9,
+                label=f"boundary {i}" if i < 5 else "_nolegend_")
     if boundaries:
-        ax.legend(fontsize=8)
+        ax.legend(fontsize=8, loc="upper right")
     ax.set_xlabel("x_world (m)")
     ax.set_ylabel("y_world (m)")
-    ax.set_title("Task 4 — Accumulated occupancy map (static environment)")
+    ax.set_title("Task 4 — Accumulated occupancy map  (0=occupied, 255=free)")
     ax.set_aspect("equal")
+    # Scale bar
+    x0 = extent[0] + 0.05 * (extent[1] - extent[0])
+    y0 = extent[2] + 0.04 * (extent[3] - extent[2])
+    ax.plot([x0, x0 + 50], [y0, y0], "r-", lw=3)
+    ax.text(x0 + 25, y0 + 2, "50 m", color="red", fontsize=8, ha="center")
     plt.tight_layout()
     plt.savefig(output_path, dpi=150)
     plt.close(fig)
@@ -87,21 +153,26 @@ def render_world_map_with_trajectory(
 ) -> None:
     """Save occupancy grid + ego trajectory + boundary polylines."""
     img = np.flipud(grid.render())
+    extent = _grid_extent(grid)
     fig, ax = plt.subplots(figsize=(12, 12))
-    ax.imshow(img, cmap="gray", vmin=0, vmax=255,
-              extent=_grid_extent(grid), origin="lower")
+    ax.imshow(img, cmap="gray", vmin=0, vmax=255, extent=extent, origin="lower")
     for i, b in enumerate(boundaries):
-        ax.plot(b[:, 0], b[:, 1], "r-", lw=1.0, alpha=0.8,
-                label="boundary" if i == 0 else "")
-    ax.plot(traj_xy[:, 0], traj_xy[:, 1], "b-", lw=0.8, alpha=0.6,
+        ax.plot(b[:, 0], b[:, 1], "r-", lw=1.5, alpha=0.9,
+                label=f"boundary {i}" if i < 5 else "_nolegend_")
+    ax.plot(traj_xy[:, 0], traj_xy[:, 1], "b-", lw=0.8, alpha=0.7,
             label="ego trajectory")
-    ax.plot(traj_xy[0, 0], traj_xy[0, 1], "go", ms=6, label="start")
-    ax.plot(traj_xy[-1, 0], traj_xy[-1, 1], "rs", ms=6, label="end")
+    ax.plot(traj_xy[0, 0], traj_xy[0, 1], "go", ms=8, label="start")
+    ax.plot(traj_xy[-1, 0], traj_xy[-1, 1], "rs", ms=8, label="end")
     ax.set_xlabel("x_world (m)")
     ax.set_ylabel("y_world (m)")
     ax.set_title("Task 4 — Occupancy map with ego trajectory")
     ax.legend(loc="upper right", fontsize=8)
     ax.set_aspect("equal")
+    # Scale bar
+    x0 = extent[0] + 0.05 * (extent[1] - extent[0])
+    y0 = extent[2] + 0.04 * (extent[3] - extent[2])
+    ax.plot([x0, x0 + 50], [y0, y0], "r-", lw=3)
+    ax.text(x0 + 25, y0 + 2, "50 m", color="red", fontsize=8, ha="center")
     plt.tight_layout()
     plt.savefig(output_path, dpi=150)
     plt.close(fig)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 import sys
 
@@ -18,6 +19,7 @@ from src.ego_trajectory import EgoTrajectory
 from src.map_visualization import (
     render_animation,
     render_ego_view,
+    render_freespace_map,
     render_world_map_static,
     render_world_map_with_trajectory,
 )
@@ -120,16 +122,6 @@ def main() -> None:
     print(f"[Task 4] Full-bag extent: x=[{x_min:.0f},{x_max:.0f}] "
           f"y=[{y_min:.0f},{y_max:.0f}] m")
 
-    # ── Occupancy grid ────────────────────────────────────────────────────────
-    grid = ProbabilisticGrid(
-        origin_xy=(0.0, 0.0),
-        extent_m=args.grid_extent,
-        resolution=args.grid_resolution,
-    )
-    n = grid._shape[0]
-    print(f"[Task 4] Grid: {n}×{n} cells ({n*n/1e6:.1f}M), "
-          f"origin=({grid.origin_x:.0f},{grid.origin_y:.0f})")
-
     # ── Track masking ─────────────────────────────────────────────────────────
     tracks_df: pd.DataFrame | None = None
     if not args.no_mask_tracks:
@@ -161,6 +153,39 @@ def main() -> None:
 
     sorted_ts = sorted(scans.keys())
     print(f"[Task 4] Total unique timestamps: {len(sorted_ts)}")
+
+    # ── Occupancy grid — auto-centered on actual driven segment ───────────────
+    # The /tf world frame may place the track anywhere (e.g. y≈450–650 m).
+    # Auto-compute the grid centroid from the actual ego poses in this run so
+    # the grid is always centred on the recorded segment.
+    if sorted_ts:
+        frame_poses = [ego_traj.pose_at(t) for t in sorted_ts]
+        xs_f = [p[0] for p in frame_poses]
+        ys_f = [p[1] for p in frame_poses]
+        cx_grid = (min(xs_f) + max(xs_f)) / 2.0
+        cy_grid = (min(ys_f) + max(ys_f)) / 2.0
+        # Pad by max_range + margin so all LiDAR returns fit inside the grid
+        pad = args.max_range + 30.0
+        half_ext = math.ceil(max(
+            (max(xs_f) - min(xs_f)) / 2.0 + pad,
+            (max(ys_f) - min(ys_f)) / 2.0 + pad,
+        ) / 50.0) * 50.0
+        grid_origin = (cx_grid, cy_grid)
+        grid_extent = half_ext
+        print(f"[Task 4] Auto-grid center: ({cx_grid:.0f}, {cy_grid:.0f})  "
+              f"extent: ±{grid_extent:.0f} m")
+    else:
+        grid_origin = (0.0, 0.0)
+        grid_extent = args.grid_extent
+
+    grid = ProbabilisticGrid(
+        origin_xy=grid_origin,
+        extent_m=grid_extent,
+        resolution=args.grid_resolution,
+    )
+    n = grid._shape[0]
+    print(f"[Task 4] Grid: {n}×{n} cells ({n*n/1e6:.1f}M), "
+          f"SW corner=({grid.origin_x:.0f},{grid.origin_y:.0f})")
 
     # ── Animation / ego-view bookkeeping ─────────────────────────────────────
     anim_stride = max(1, len(sorted_ts) // max(args.animation_frames, 1))
@@ -255,6 +280,9 @@ def main() -> None:
     print("[Task 4] Rendering world_map_static.png …")
     render_world_map_static(grid, boundaries, str(output_dir / "world_map_static.png"))
 
+    print("[Task 4] Rendering freespace_map.png …")
+    render_freespace_map(grid, boundaries, str(output_dir / "freespace_map.png"))
+
     stride = max(1, len(ego_traj._x_w) // 5000)
     traj_xy = ego_traj.trajectory_xy()[::stride]
     print("[Task 4] Rendering world_map_with_trajectory.png …")
@@ -281,7 +309,10 @@ def main() -> None:
 
     print("\n[Task 4] Done.")
     print(f"  Timestamps processed : {len(sorted_ts)}")
+    print(f"  Grid center          : ({grid_origin[0]:.0f}, {grid_origin[1]:.0f})")
+    print(f"  Grid extent          : ±{grid_extent:.0f} m")
     print(f"  Free space           : {free_cells * res2:.0f} m²")
+    print(f"  Occupied area        : {occ_cells * res2:.0f} m²")
     print(f"  Boundary polylines   : {len(boundaries)}")
     print(f"  Total boundary length: {total_len:.0f} m")
     print(f"  Outputs              : {output_dir}/")
