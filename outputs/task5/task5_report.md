@@ -25,7 +25,7 @@ on unwrapped yaw). If fewer than 3 history samples are available, `w = 0` (reduc
 
 Kinematic update per substep (in ego1-frame coordinates):
 
-```
+```text
 v = sqrt(vx^2 + vy^2)
 if |w| > 1e-3 rad/s:
     x' = x + (v/w)*(sin(yaw + w*dt) - sin(yaw))
