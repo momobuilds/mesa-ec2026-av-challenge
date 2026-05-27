@@ -39,7 +39,7 @@ def parse_args() -> argparse.Namespace:
                         help="Subset of PointCloud2 topics. Defaults to all 7.")
     parser.add_argument("--n-init", type=int, default=3,
                         help="Consecutive hits before tentative→confirmed.")
-    parser.add_argument("--max-age", type=int, default=5,
+    parser.add_argument("--max-age", type=int, default=8,
                         help="Missed frames before a confirmed track is deleted.")
     parser.add_argument("--bev-frames", type=int, default=5,
                         help="Number of BEV tracking plots to save.")

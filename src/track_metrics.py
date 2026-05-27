@@ -59,10 +59,16 @@ def build_summary_df(all_tracks: list[Track]) -> pd.DataFrame:
         else:
             start_ts = hist[0][0]
             end_ts = hist[-1][0]
-            # Count observed vs coasted frames from status history is not stored,
-            # so approximate: n_observed = hits, total = len(hist)
+            # n_observed = total EKF update hits.
+            # n_coasted  = history entries appended during COASTING (missed frames
+            #              while CONFIRMED/COASTING) — these are appended by
+            #              MultiObjectTracker.step() on mark_missed, distinct from
+            #              the creation entry (hist[0]) and update entries.
+            # Formula: create_track appends hist[0]; update_track appends one per
+            # hit; mark_missed + step appends one per coasted frame (conf/coast only).
+            # So len(hist) = 1 (creation) + hits + coasted_frames.
             n_observed = trk.hits
-            n_coasted = max(0, len(hist) - trk.hits)
+            n_coasted = max(0, len(hist) - 1 - trk.hits)  # subtract creation entry
 
             # Path length from history positions
             path_m = 0.0
