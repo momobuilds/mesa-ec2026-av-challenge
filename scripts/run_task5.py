@@ -63,9 +63,19 @@ def main() -> None:
     mat_path = mat_candidates[0]
     print(f"  ego.mat   : {mat_path}")
 
+    # ego_log is used exclusively for substep ego-motion compensation (Doppler
+    # correction: provides ekf_vx/vy at each prediction substep).
     ego_log = EgoStateLog(mat_path, bag_start_ns)
-    ego_traj = EgoTrajectory.from_ego_log(ego_log)
     print(f"  EgoStateLog: {ego_log}")
+
+    # ego_traj is used for ego-frame → world-frame coordinate conversion.
+    # Prefer the TF-based approach (no drift) over velocity integration.
+    try:
+        ego_traj = EgoTrajectory.from_bag_tf(args.bag_dir)
+        print(f"  EgoTrajectory: from /tf ({ego_traj._timestamps_ns.shape[0]} samples)")
+    except Exception as exc:
+        print(f"  /tf unavailable ({exc}), falling back to ego.mat integration")
+        ego_traj = EgoTrajectory.from_ego_log(ego_log)
 
     # ── Load tracks ───────────────────────────────────────────────────────────
     tracks_df = pd.read_csv(tracks_path)
