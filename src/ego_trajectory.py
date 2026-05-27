@@ -1,28 +1,37 @@
-"""World-frame ego pose trajectory by integrating EgoStateLog velocities.
+"""World-frame ego pose trajectory for the challenge pipeline.
 
-The EKF outputs (ekf_vx, ekf_vy) in ego.mat are ego-frame velocities
-(longitudinal / lateral), NOT world-frame. To integrate into world-frame
-displacement, rotate each sample by the instantaneous heading:
+Two sources are supported (professor-confirmed strategy):
+
+BagTFReader  ←  **preferred for ego pose in map frame**
+    The ``/tf`` topic in the bag publishes ``map → center_of_gravity`` at
+    ~200 Hz.  :meth:`EgoTrajectory.from_bag_tf` wraps this source and is
+    the recommended way to obtain world-frame pose.
+
+EgoStateLog (ego.mat)  ←  **used only for Doppler velocity correction**
+    The EKF outputs (ekf_vx, ekf_vy) are ego-frame velocities needed to
+    remove the ego-motion component from radar Doppler measurements.
+    :meth:`EgoTrajectory.from_ego_log` integrates them into a world-frame
+    trajectory as a fallback when the bag is unavailable, but the TF-based
+    approach is preferred.
+
+Integration note for from_ego_log
+----------------------------------
+The (ekf_vx, ekf_vy) in ego.mat are in the ego frame (longitudinal/lateral).
+To integrate into world-frame displacement, each sample is rotated by the
+instantaneous heading::
 
     dx_w = vx · cos(h) − vy · sin(h)
     dy_w = vx · sin(h) + vy · cos(h)
 
 heading in ego.mat is a monotonically increasing odometer value (never
-wrapped to [−π, π]). cos/sin are 2π-periodic, so no unwrapping is needed.
-
-predict_state() in motion_model.py skips this rotation because Δt ≈ 0.2 s
-gives Δheading ≈ 0.4° (rotation ≈ identity for a single step). Here we
-integrate the full trajectory so the rotation is essential.
-
-Origin: bag start → (x=0, y=0), heading=h[0].
+wrapped to [−π, π]).  cos/sin are 2π-periodic, so no unwrapping is needed.
 """
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import numpy as np
-
-from src.tf_utils import EgoStateLog
 
 
 def _rot2d(heading_rad: float) -> np.ndarray:
@@ -32,7 +41,12 @@ def _rot2d(heading_rad: float) -> np.ndarray:
 
 
 class EgoTrajectory:
-    """Continuous world-frame pose trajectory integrated from EgoStateLog."""
+    """Continuous world-frame pose trajectory for the ego vehicle.
+
+    Construct via:
+    - :meth:`from_bag_tf`  — TF-based (preferred, uses ``/tf`` from the bag)
+    - :meth:`from_ego_log` — velocity-integration fallback (uses ego.mat)
+    """
 
     def __init__(
         self,
@@ -41,14 +55,50 @@ class EgoTrajectory:
         y_w: np.ndarray,
         heading: np.ndarray,
     ) -> None:
-        self._timestamps_ns = timestamps_ns
-        self._x_w = x_w
-        self._y_w = y_w
-        self._heading = heading
+        self._timestamps_ns = np.asarray(timestamps_ns, dtype=np.float64)
+        self._x_w = np.asarray(x_w, dtype=np.float64)
+        self._y_w = np.asarray(y_w, dtype=np.float64)
+        self._heading = np.asarray(heading, dtype=np.float64)
+
+    # ── constructors ─────────────────────────────────────────────────────────
 
     @classmethod
-    def from_ego_log(cls, ego_log: EgoStateLog) -> "EgoTrajectory":
-        """Integrate all EgoStateLog samples into a world-frame trajectory."""
+    def from_bag_tf(cls, bag_dir: str | Path) -> "EgoTrajectory":
+        """Build EgoTrajectory from the ``/tf`` topic in the bag  (preferred).
+
+        Reads every ``map → center_of_gravity`` transform from the bag's
+        ``/tf`` topic and stores them as a time-indexed trajectory.  This
+        avoids drift caused by velocity integration and is the
+        professor-recommended source for world-frame ego pose.
+
+        The ego.mat velocity data is still required separately for Doppler
+        velocity correction (via :class:`~src.tf_utils.EgoStateLog`).
+
+        Parameters
+        ----------
+        bag_dir:
+            Directory containing the ``*.db3`` bag files.
+        """
+        from src.tf_utils import BagTFReader
+        reader = BagTFReader(bag_dir)
+        return cls(
+            timestamps_ns=reader.timestamps_ns,
+            x_w=reader.x,
+            y_w=reader.y,
+            heading=reader.heading,
+        )
+
+    @classmethod
+    def from_ego_log(cls, ego_log: "Any") -> "EgoTrajectory":
+        """Integrate all EgoStateLog samples into a world-frame trajectory.
+
+        Fallback for when the bag is unavailable.  Prefer
+        :meth:`from_bag_tf` for accuracy.
+
+        **Do not use these integrated positions for Doppler correction** —
+        that requires only the instantaneous ego velocity from
+        :meth:`~src.tf_utils.EgoStateLog.interpolate`.
+        """
         t = ego_log._timestamps_ns
         vx = ego_log._vx
         vy = ego_log._vy
@@ -92,7 +142,7 @@ class EgoTrajectory:
         return out
 
     def world_extent(self) -> tuple[float, float, float, float]:
-        """Return (x_min, x_max, y_min, y_max) over all integrated samples."""
+        """Return (x_min, x_max, y_min, y_max) over all trajectory samples."""
         return (
             float(self._x_w.min()), float(self._x_w.max()),
             float(self._y_w.min()), float(self._y_w.max()),
@@ -101,3 +151,7 @@ class EgoTrajectory:
     def trajectory_xy(self) -> np.ndarray:
         """Return (N, 2) float64 array of all world-frame positions."""
         return np.column_stack([self._x_w, self._y_w])
+
+
+# Allow `from src.tf_utils import EgoStateLog` in type hints without circular import
+from typing import Any

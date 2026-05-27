@@ -75,7 +75,11 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── Ego state log ──────────────────────────────────────────────────────────
+    # ── Ego state log (Doppler correction only) ───────────────────────────────
+    # ego.mat provides ekf_vx/vy in ego frame — needed only to remove the
+    # ego-motion component from radar Doppler measurements.
+    # For ego pose in map frame, BagTFReader reads /tf (map→center_of_gravity)
+    # from the bag directly (professor-confirmed approach).
     ego_log: EgoStateLog | None = None
     for candidate in [
         Path(args.bag_dir) / "ego.mat",
@@ -87,7 +91,7 @@ def main() -> None:
                     str(candidate),
                     bag_start_ns=summary.starting_time_ns or 0,
                 )
-                print(f"[Task 3] Ego state log: {candidate.as_posix()}")
+                print(f"[Task 3] Ego state log (Doppler only): {candidate.as_posix()}")
                 print(f"         {ego_log}")
             except Exception as exc:
                 print(f"[Task 3] ego.mat load failed: {exc}")

@@ -66,6 +66,12 @@ def parse_args() -> argparse.Namespace:
 
 
 def _load_ego(bag_dir: str, bag_start_ns: int) -> EgoStateLog | None:
+    """Load ego.mat for Doppler velocity correction only.
+
+    Note: ego.mat is NOT used for ego pose in map frame.  The /tf topic
+    in the bag provides map→center_of_gravity directly and is more accurate.
+    Use EgoTrajectory.from_bag_tf() for world-frame pose.
+    """
     for candidate in [
         Path(bag_dir) / "ego.mat",
         *Path(bag_dir).parent.glob("**/ego.mat"),
@@ -73,7 +79,7 @@ def _load_ego(bag_dir: str, bag_start_ns: int) -> EgoStateLog | None:
         if candidate.exists():
             try:
                 log = EgoStateLog(str(candidate), bag_start_ns=bag_start_ns)
-                print(f"[Task 4] Ego log: {candidate}  {log}")
+                print(f"[Task 4] Ego log (Doppler correction only): {candidate}  {log}")
                 return log
             except Exception as exc:
                 print(f"[Task 4] ego.mat load failed: {exc}")
@@ -95,12 +101,21 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── Ego trajectory ────────────────────────────────────────────────────────
-    ego_log = _load_ego(args.bag_dir, bag_start_ns)
-    if ego_log is None:
-        print("[Task 4] ERROR: ego.mat not found")
-        sys.exit(1)
-    ego_traj = EgoTrajectory.from_ego_log(ego_log)
+    # ── Ego trajectory (from /tf topic in bag — professor-confirmed approach) ─
+    # The bag's /tf topic provides map→center_of_gravity transforms at ~200 Hz.
+    # This is more accurate than integrating ekf_vx/ekf_vy from ego.mat.
+    # ego.mat is loaded separately for Doppler velocity correction only.
+    try:
+        ego_traj = EgoTrajectory.from_bag_tf(args.bag_dir)
+        print(f"[Task 4] Ego trajectory from /tf: {ego_traj._timestamps_ns.shape[0]} samples")
+    except Exception as exc:
+        print(f"[Task 4] /tf not available ({exc}), falling back to ego.mat integration")
+        ego_log = _load_ego(args.bag_dir, bag_start_ns)
+        if ego_log is None:
+            print("[Task 4] ERROR: neither /tf nor ego.mat found for ego trajectory")
+            sys.exit(1)
+        ego_traj = EgoTrajectory.from_ego_log(ego_log)
+
     x_min, x_max, y_min, y_max = ego_traj.world_extent()
     print(f"[Task 4] Full-bag extent: x=[{x_min:.0f},{x_max:.0f}] "
           f"y=[{y_min:.0f},{y_max:.0f}] m")

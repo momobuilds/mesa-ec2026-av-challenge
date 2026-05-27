@@ -45,6 +45,15 @@ Covariance is propagated with an analytical Jacobian ∂f/∂state, ensuring the
 
 ## 3. Evaluation Methodology
 
+### Ego Trajectory Source (updated)
+
+`EgoTrajectory` is instantiated via `EgoTrajectory.from_bag_tf(bag_dir)`, which reads the
+45 080 `map → center_of_gravity` transforms from the `/tf` topic in the bag at ~200 Hz.
+This replaces the previous velocity-integration approach (`from_ego_log`) that accumulated
+numerical drift over the 240 s bag. The TF-based pose is the ground-truth localisation
+output of the vehicle's own stack — no cumulative error propagates into the world-frame
+coordinate conversion used during evaluation.
+
 For each confirmed track with ≥5 frames, at each source timestamp `t`:
 - Predict future position at `t + h` for `h ∈ {0.5, 1.0, 2.0}` s.
 - Look up the closest actual track row within ±100 ms of `t + h`. If none: `missed = True`.
@@ -87,7 +96,7 @@ The track with the highest yaw variance was selected as the most interesting tur
 - **Velocity estimation upstream:** The 5.43 m mean FDE at 0.5 s is dominated by poor EKF velocity estimates from Task 3. This is not a predictor bug; it is an inherited data quality issue. Fixing Task 3's radar Doppler integration would improve FDE substantially.
 - **No intent prediction:** Both models assume current motion continues. A driver beginning to brake or steer is not anticipated. That is Task 6 scope.
 - **Constant turn rate breaks during braking:** CTRV assumes constant speed `v`; deceleration changes the arc radius and accumulates lateral error.
-- **Inherited ego-trajectory drift:** World-frame predictions use `EgoTrajectory` (Task 4 output). Drift in the integrated ego pose propagates into prediction error, especially at the 2 s horizon.
+- ~~**Inherited ego-trajectory drift:**~~ **Resolved.** `EgoTrajectory` now reads pose directly from the bag's `/tf` topic (`map → center_of_gravity`) via `BagTFReader`. No velocity-integration drift accumulates, eliminating this source of world-frame evaluation error.
 - **ω estimation latency:** CTRV needs ≥3 frames before it differs from CV. New tracks produce identical predictions from both models for their first ~0.6 s.
 - **No multi-agent reasoning:** Predictions are fully independent — no collision avoidance or interaction modelling between opponents.
 - **Short bag coverage:** The 60-frame bag gives only ~12 s of data. Miss rates of 56–99% at the tested horizons mean evaluation statistics are sparse, especially at 2.0 s.

@@ -775,7 +775,11 @@ def main() -> None:
     )
     print(f"\n[Task 2] {total_dets} raw detections across all sensors")
 
-    # Load ego velocity log if available
+    # Load ego velocity log for Doppler velocity correction only.
+    # NOTE: ego.mat is NOT used for ego pose in map frame.  The bag's /tf topic
+    # (map→center_of_gravity) is the authoritative ego pose source (BagTFReader).
+    # ego.mat provides ekf_vx/vy which are needed to remove the ego-motion
+    # component from radar Doppler measurements (professor-confirmed approach).
     ego_log: EgoStateLog | None = None
     ego_mat_path = Path(args.bag_dir) / "ego.mat"
     if not ego_mat_path.exists():
@@ -785,7 +789,7 @@ def main() -> None:
     if ego_mat_path.exists():
         try:
             ego_log = EgoStateLog(str(ego_mat_path), bag_start_ns=summary.starting_time_ns or 0)
-            print(f"[Task 2] Loaded ego state log from {ego_mat_path.as_posix()}")
+            print(f"[Task 2] Loaded ego state log (Doppler correction only) from {ego_mat_path.as_posix()}")
         except Exception as exc:  # noqa: BLE001
             print(f"[Task 2] ego.mat load failed: {exc}")
 
