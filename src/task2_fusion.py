@@ -56,6 +56,8 @@ _MAX_MAHAL = 5.0
 
 # Association time window (nanoseconds)
 ASSOC_WINDOW_NS = int(50e6)  # 50 ms
+MAX_FALLBACK_SPEED_MPS = 35.0
+MAX_BEV_ARROW_LENGTH_M = 7.0
 
 # Fused detections CSV columns
 FUSED_COLUMNS = [
@@ -729,16 +731,10 @@ def _annotate_camera(
     row["camera_v"] = "" if camera_v is None else round(camera_v, 2)
     row["camera_score"] = float(visible_score if synced else 0.0)
     row["camera_validated"] = validated
-    row["n_camera"] = 1 if validated else 0
-
-    if validated:
-        sensors = {
-            item for item in str(row.get("sensors", "")).split("+")
-            if item
-        }
-        sensors.add(_sensor_label(topic))
-        row["sensors"] = "+".join(sorted(sensors))
-        row["confidence"] = float(np.clip(float(row["confidence"]) + 0.05, 0.0, 1.0))
+    # Camera projection is a sanity check only. The bag has no calibrated
+    # camera detector, so this must not count as sensor support or boost
+    # fusion confidence.
+    row["n_camera"] = 0
 
 
 def _camera_projection_score(row: dict[str, Any]) -> tuple[float | None, float | None, float]:
@@ -786,13 +782,30 @@ def _limit_velocity_pair(
     vx: float,
     vy: float,
     *,
-    max_speed: float = 60.0,
+    max_speed: float = MAX_FALLBACK_SPEED_MPS,
 ) -> tuple[float, float]:
     speed = math.hypot(vx, vy)
     if speed <= max_speed or speed <= 1e-9:
         return float(vx), float(vy)
     scale = max_speed / speed
     return float(vx * scale), float(vy * scale)
+
+
+def _velocity_arrow_delta(
+    vx: float,
+    vy: float,
+    *,
+    seconds_scale: float = 1.0,
+    max_length_m: float = MAX_BEV_ARROW_LENGTH_M,
+) -> tuple[float, float]:
+    """Return a capped BEV arrow delta so outlier velocities do not dominate plots."""
+    dx = float(vx) * seconds_scale
+    dy = float(vy) * seconds_scale
+    length = math.hypot(dx, dy)
+    if length <= max_length_m or length <= 1e-9:
+        return dx, dy
+    scale = max_length_m / length
+    return dx * scale, dy * scale
 
 
 # ── BEV plot ─────────────────────────────────────────────────────────────────
@@ -848,24 +861,40 @@ def plot_fused_bev(
         ])
         R2 = np.array([[c_ang, -s_ang], [s_ang, c_ang]])
         corners = (R2 @ corners_local.T).T + np.array([cx, cy])
-        poly = Polygon(corners[:, [1, 0]], closed=True,
-                       fill=False, edgecolor="#E91E63", linewidth=2.5)
+        is_predicted = str(det.get("is_predicted", False)).lower() == "true"
+        box_color = "#757575" if is_predicted else "#E91E63"
+        poly = Polygon(
+            corners[:, [1, 0]],
+            closed=True,
+            fill=False,
+            edgecolor=box_color,
+            linewidth=1.6 if is_predicted else 2.4,
+            linestyle="--" if is_predicted else "-",
+            alpha=0.65 if is_predicted else 1.0,
+        )
         ax.add_patch(poly)
 
         # Velocity arrow
         vx, vy = float(det.get("vx", 0)), float(det.get("vy", 0))
         if math.hypot(vx, vy) > 0.5:
-            ax.annotate("", xy=(cy + vy * 2, cx + vx * 2), xytext=(cy, cx),
-                        arrowprops=dict(arrowstyle="->", color="#E91E63", lw=1.5))
+            arrow_dx, arrow_dy = _velocity_arrow_delta(vx, vy)
+            ax.annotate(
+                "",
+                xy=(cy + arrow_dy, cx + arrow_dx),
+                xytext=(cy, cx),
+                arrowprops=dict(arrowstyle="->", color=box_color, lw=1.4),
+            )
 
         # Heading arrow (yaw direction)
-        hx = math.cos(yaw) * 3
-        hy = math.sin(yaw) * 3
-        ax.annotate("", xy=(cy + hy, cx + hx), xytext=(cy, cx),
-                    arrowprops=dict(arrowstyle="->", color="#FF9800", lw=1.5))
+        if not is_predicted:
+            hx = math.cos(yaw) * 3
+            hy = math.sin(yaw) * 3
+            ax.annotate("", xy=(cy + hy, cx + hx), xytext=(cy, cx),
+                        arrowprops=dict(arrowstyle="->", color="#FF9800", lw=1.5))
 
-        label = f"{det['detection_id']}\n{det['sensors']}"
-        ax.text(cy, cx, label, fontsize=6, ha="center", va="bottom", color="#E91E63",
+        track_label = f"T{det.get('track_id', '?')}"
+        label = f"{track_label} pred" if is_predicted else f"{track_label} {det['sensors']}"
+        ax.text(cy, cx, label, fontsize=6, ha="center", va="bottom", color=box_color,
                 bbox={"facecolor": "white", "alpha": 0.6, "pad": 1, "edgecolor": "none"})
 
     ax.set_xlabel("lateral y_ego (m)")
@@ -881,8 +910,9 @@ def plot_fused_bev(
     from matplotlib.lines import Line2D
     legend_els = [
         Line2D([0], [0], color="#E91E63", lw=2, label="fused detection"),
+        Line2D([0], [0], color="#757575", lw=1.5, ls="--", label="prediction"),
         Line2D([0], [0], color="#FF9800", lw=1.5, ls="-", label="heading"),
-        Line2D([0], [0], color="#E91E63", lw=1.5, ls="-", label="velocity×2"),
+        Line2D([0], [0], color="#E91E63", lw=1.5, ls="-", label="velocity capped"),
     ]
     for topic, c in sensor_colors.items():
         legend_els.append(

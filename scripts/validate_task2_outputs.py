@@ -59,6 +59,12 @@ def main() -> int:
         errors.append(f"no PNG visualisations found in {output_dir}")
     elif not any(_is_png(path) for path in pngs):
         errors.append("PNG files exist but none have a valid PNG signature")
+    camera_projection_pngs = sorted(output_dir.glob("verify_camera_projection_*.png"))
+    if len(camera_projection_pngs) < 3:
+        errors.append(
+            "expected at least 3 camera projection verification images "
+            f"(found {len(camera_projection_pngs)})"
+        )
 
     if rows:
         timestamps = {row["timestamp"] for row in rows}
@@ -84,18 +90,20 @@ def main() -> int:
         max_sources = max(
             _int(row.get("n_lidar"))
             + _int(row.get("n_radar"))
-            + _int(row.get("n_camera"))
             for row in rows
         )
         if max_sources < 2:
-            errors.append("no row has at least two source indicators")
+            errors.append("no row has both LiDAR and radar source indicators")
 
         radar_rows = sum(_int(row.get("n_radar")) > 0 for row in rows)
-        camera_rows = sum(_int(row.get("n_camera")) > 0 for row in rows)
+        camera_projection_rows = sum(
+            str(row.get("camera_validated", "")).lower() == "true"
+            for row in rows
+        )
         predicted_rows = sum(str(row.get("is_predicted", "")).lower() == "true" for row in rows)
 
-        if camera_rows == 0:
-            errors.append("no camera-validated/source-supported rows found")
+        if camera_projection_rows == 0:
+            errors.append("no camera projection-validated rows found")
         if radar_rows == 0:
             warnings.append(
                 "no radar-associated rows; acceptable only if the report explains "
@@ -118,12 +126,13 @@ def main() -> int:
         print(f"- rows: {len(rows)}")
         print(f"- timestamps: {len(timestamps)}")
         print(f"- nonzero velocity rows: {len(nonzero_velocity)}")
-        print(f"- max source indicators per row: {max_sources}")
+        print(f"- max LiDAR/radar source indicators per row: {max_sources}")
         print(f"- radar-associated rows: {radar_rows}")
-        print(f"- camera-supported rows: {camera_rows}")
+        print(f"- camera projection rows: {camera_projection_rows}")
         print(f"- temporal prediction rows: {predicted_rows}")
         print(f"- low confidence rows (<0.50): {low_conf}")
         print(f"- png visualisations: {len(pngs)}")
+        print(f"- camera projection visualisations: {len(camera_projection_pngs)}")
 
     if warnings:
         print("\nWarnings:")
@@ -173,8 +182,10 @@ def _source_flag_errors(rows: list[dict[str, str]]) -> list[str]:
             errors.append(f"{det_id}: n_lidar>0 but sensors={sensors!r}")
         if _int(row.get("n_radar")) > 0 and "radar" not in sensors:
             errors.append(f"{det_id}: n_radar>0 but sensors={sensors!r}")
-        if _int(row.get("n_camera")) > 0 and "camera" not in sensors:
-            errors.append(f"{det_id}: n_camera>0 but sensors={sensors!r}")
+        if _int(row.get("n_camera")) > 0:
+            errors.append(
+                f"{det_id}: n_camera>0 even though camera projection is not sensor support"
+            )
         if not is_prediction and _int(row.get("n_lidar")) + _int(row.get("n_radar")) == 0:
             errors.append(f"{det_id}: observed row has no LiDAR or radar source")
     return errors

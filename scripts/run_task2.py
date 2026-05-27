@@ -20,7 +20,7 @@ from src.sensor_detectors import detect_all_sensors
 from src.oriented_bbox import minimum_area_bbox
 from src.radar_doppler import cluster_velocity, extract_cluster_points
 from src.task1_detection import SQLitePointCloudReader, pointcloud2_to_structured_array
-from src.camera_projection import draw_projected_boxes, read_compressed_image
+from src.camera_projection import read_compressed_image
 from src.task2_fusion import ASSOC_WINDOW_NS, run_fusion, plot_fused_bev
 from src.tf_utils import EgoStateLog, transform_points
 
@@ -54,7 +54,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-frames",
         type=int,
-        default=20,
+        default=200,
         help="Maximum number of point cloud frames to process per sensor.",
     )
     parser.add_argument(
@@ -153,7 +153,7 @@ def _build_doppler_vel(
             continue
         topic_velmap: dict = {}
 
-        # Build timestamp → structured points map from the raw messages
+        # Build timestamp-to-structured-points map from the raw messages.
         raw_by_ts: dict = {}
         for msg_dict in reader.iter_pointcloud_messages(topic, max_frames=len(frames) + 5):
             try:
@@ -342,16 +342,99 @@ def _save_lidar_overlay(all_frames: dict, output_dir: Path) -> Path:
     return output_path
 
 
+def _select_camera_projection_frames(
+    df,
+    *,
+    max_images: int = 5,
+    image_width: int = 1928,
+    image_height: int = 500,
+) -> list[int]:
+    """Select timestamps with the strongest in-image observed fusion evidence."""
+    if df.empty:
+        return []
+
+    candidates = df.copy()
+    for column in ("camera_u", "camera_v", "center_x", "confidence"):
+        if column in candidates.columns:
+            candidates[column] = np.asarray(
+                candidates[column].apply(lambda value: _safe_float(value, np.nan)),
+                dtype=float,
+            )
+
+    if "is_predicted" in candidates.columns:
+        candidates = candidates[
+            candidates["is_predicted"].astype(str).str.lower() != "true"
+        ]
+    if "camera_validated" in candidates.columns:
+        candidates = candidates[
+            candidates["camera_validated"].astype(str).str.lower() == "true"
+        ]
+
+    candidates = candidates[
+        candidates["camera_u"].between(0, image_width - 1)
+        & candidates["camera_v"].between(0, image_height - 1)
+        & candidates["center_x"].between(5.0, 95.0)
+    ].copy()
+    if candidates.empty:
+        return []
+
+    # Prefer frames where several projected fusion tracks land in the plausible
+    # road/actor band. This is still projection-only, not image detection.
+    candidates["visible_score"] = (
+        (candidates["camera_v"] - 245.0).clip(lower=0.0) / 40.0
+        + (95.0 - candidates["center_x"]).clip(lower=0.0) / 90.0
+        + candidates["confidence"].clip(lower=0.0)
+    )
+    grouped = (
+        candidates.groupby("timestamp_ns")
+        .agg(
+            best_visible_score=("visible_score", "max"),
+            total_visible_score=("visible_score", "sum"),
+            projected_rows=("timestamp_ns", "count"),
+            mean_confidence=("confidence", "mean"),
+            nearest_distance=("center_x", "min"),
+            lowest_image_point=("camera_v", "max"),
+        )
+        .sort_values(
+            [
+                "best_visible_score",
+                "lowest_image_point",
+                "nearest_distance",
+                "projected_rows",
+                "total_visible_score",
+            ],
+            ascending=[False, False, True, False, False],
+        )
+    )
+    return [int(ts) for ts in grouped.head(max_images).index]
+
+
+def _format_projection_label(row: dict[str, Any]) -> str:
+    """Compact projected-center label for camera verification images."""
+    track_id = row.get("track_id", "?")
+    distance = _safe_float(row.get("center_x"), 0.0)
+    timestamp_ns = row.get("timestamp_ns", "?")
+    sensors = row.get("sensors", "")
+    return f"T{track_id} {distance:.1f}m t={timestamp_ns} {sensors}".strip()
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _save_camera_projection(
     summary,
     df,
     output_dir: Path,
     camera_topic: str,
-) -> Path:
+) -> list[Path]:
     import cv2
 
-    output_path = output_dir / "verify_camera_projection_000.png"
     if df.empty:
+        output_path = output_dir / "verify_camera_projection_000.png"
         image = np.full((500, 1928, 3), 255, dtype=np.uint8)
         cv2.putText(
             image,
@@ -364,33 +447,145 @@ def _save_camera_projection(
             cv2.LINE_AA,
         )
         cv2.imwrite(str(output_path), image)
-        return output_path
+        return [output_path]
 
-    if "camera_validated" in df.columns and bool(df["camera_validated"].any()):
-        target_ts = int(df[df["camera_validated"]]["timestamp_ns"].iloc[0])
-    else:
-        target_ts = int(df["timestamp_ns"].astype(int).iloc[0])
+    target_timestamps = _select_camera_projection_frames(df, max_images=5)
+    if not target_timestamps:
+        target_timestamps = [int(df["timestamp_ns"].astype(int).iloc[0])]
 
-    image_result = _read_nearest_compressed_image(summary, camera_topic, target_ts)
-    if image_result is None:
-        image = np.full((500, 1928, 3), 255, dtype=np.uint8)
+    output_paths: list[Path] = []
+    for image_index, target_ts in enumerate(target_timestamps):
+        output_path = output_dir / f"verify_camera_projection_{image_index:03d}.png"
+        image_result = _read_nearest_compressed_image(summary, camera_topic, target_ts)
+        if image_result is None:
+            image = np.full((500, 1928, 3), 255, dtype=np.uint8)
+            cv2.putText(
+                image,
+                f"Camera image unavailable: {camera_topic}",
+                (40, 250),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.0,
+                (0, 0, 255),
+                2,
+                cv2.LINE_AA,
+            )
+        else:
+            image_ts, image = image_result
+            detections_df = _camera_rows_for_timestamp(df, target_ts)
+            detections = detections_df.to_dict("records")
+            _draw_projection_markers(
+                image,
+                detections,
+                target_ts=target_ts,
+                image_ts=image_ts,
+                camera_topic=camera_topic,
+            )
+
+        cv2.imwrite(str(output_path), image)
+        output_paths.append(output_path)
+    return output_paths
+
+
+def _camera_rows_for_timestamp(df, timestamp_ns: int):
+    detections_df = df[df["timestamp_ns"].astype(int) == int(timestamp_ns)].copy()
+    if "is_predicted" in detections_df.columns:
+        detections_df = detections_df[
+            detections_df["is_predicted"].astype(str).str.lower() != "true"
+        ]
+    if "camera_score" in detections_df.columns:
+        detections_df = detections_df[
+            detections_df["camera_score"].apply(lambda value: _safe_float(value)) > 0.0
+        ]
+    detections_df = detections_df[
+        detections_df["camera_u"].apply(lambda value: 0 <= _safe_float(value, -1) < 1928)
+        & detections_df["camera_v"].apply(lambda value: 0 <= _safe_float(value, -1) < 500)
+    ]
+    return detections_df.sort_values(
+        ["camera_v", "confidence", "center_x"],
+        ascending=[False, False, True],
+    ).head(5)
+
+
+def _draw_projection_markers(
+    image: np.ndarray,
+    detections: list[dict[str, Any]],
+    *,
+    target_ts: int,
+    image_ts: int,
+    camera_topic: str,
+) -> None:
+    import cv2
+
+    label_lines: list[str] = []
+    for marker_index, det in enumerate(detections, start=1):
+        u = _safe_float(det.get("camera_u"), -1)
+        v = _safe_float(det.get("camera_v"), -1)
+        if not (0 <= u < image.shape[1] and 0 <= v < image.shape[0]):
+            continue
+        center = (int(round(u)), int(round(v)))
+        color = (0, 180, 255)
+        cv2.circle(image, center, 6, color, 2)
+        cv2.drawMarker(
+            image,
+            center,
+            color,
+            markerType=cv2.MARKER_CROSS,
+            markerSize=14,
+            thickness=1,
+        )
+
+        short_label = f"{marker_index}:T{det.get('track_id', '?')}"
+        label_origin = (min(center[0] + 8, image.shape[1] - 80), max(20, center[1] - 8))
         cv2.putText(
             image,
-            f"Camera image unavailable: {camera_topic}",
-            (40, 250),
+            short_label,
+            label_origin,
             cv2.FONT_HERSHEY_SIMPLEX,
-            1.0,
-            (0, 0, 255),
-            2,
+            0.45,
+            color,
+            1,
             cv2.LINE_AA,
         )
-    else:
-        _, image = image_result
-        detections = df[df["timestamp_ns"].astype(int) == target_ts].to_dict("records")
-        image = draw_projected_boxes(image, detections, color=(0, 255, 0), thickness=2)
+        label_lines.append(f"{marker_index}. {_format_projection_label(det)}")
 
-    cv2.imwrite(str(output_path), image)
-    return output_path
+    header = (
+        "Projection-only camera check; no image detector or 2D boxes in bag | "
+        f"fusion_ts={target_ts} | image_ts={image_ts}"
+    )
+    cv2.putText(
+        image,
+        header,
+        (35, 35),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (0, 180, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    if label_lines:
+        panel_height = min(30 + 24 * len(label_lines), 155)
+        overlay = image.copy()
+        cv2.rectangle(
+            overlay,
+            (20, image.shape[0] - panel_height - 15),
+            (image.shape[1] - 20, image.shape[0] - 15),
+            (0, 0, 0),
+            -1,
+        )
+        cv2.addWeighted(overlay, 0.45, image, 0.55, 0, image)
+        y = image.shape[0] - panel_height + 10
+        for line in label_lines:
+            cv2.putText(
+                image,
+                line,
+                (35, y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.48,
+                (0, 180, 255),
+                1,
+                cv2.LINE_AA,
+            )
+            y += 24
 
 
 def _write_task2_report(
@@ -413,10 +608,15 @@ def _write_task2_report(
         for topic, frames in all_frames.items()
     ]
     raw_total = sum(count for _, _, count in per_sensor)
+    side_lidar_zero = {
+        sensor: count
+        for sensor, _, count in per_sensor
+        if sensor in {"lidar_left", "lidar_right"} and count == 0
+    }
 
     if df.empty:
         timestamps = low_conf = nonzero_velocity = 0
-        radar_rows = camera_rows = predicted_rows = max_sources = 0
+        radar_rows = camera_projection_rows = predicted_rows = max_sources = 0
         velocity_sources = {}
     else:
         timestamps = int(df["timestamp_ns"].nunique())
@@ -428,14 +628,15 @@ def _write_task2_report(
             ).sum()
         )
         radar_rows = int((df["n_radar"].astype(int) > 0).sum())
-        camera_rows = int((df["n_camera"].astype(int) > 0).sum())
+        camera_projection_rows = int(
+            df["camera_validated"].astype(str).str.lower().eq("true").sum()
+        )
         predicted_rows = int(df["is_predicted"].astype(bool).sum())
         velocity_sources = df["velocity_source"].value_counts().to_dict()
         max_sources = int(
             (
                 df["n_lidar"].astype(int)
                 + df["n_radar"].astype(int)
-                + df["n_camera"].astype(int)
             ).max()
         )
 
@@ -452,8 +653,9 @@ def _write_task2_report(
         "",
         "- LiDAR clusters provide geometric position and oriented bounding-box evidence.",
         "- Radar clusters are processed and can contribute Doppler velocity when spatial association is plausible.",
-        "- Camera data contributes projection/timestamp validation because no camera detector or camera_info topics are available.",
-        "- A lightweight temporal filter assigns `track_id`, estimates fallback velocity, and predicts through short missing-data gaps.",
+        "- Camera images are used only for projection/timestamp sanity checks because no camera detector or camera_info topics are available.",
+        "- A lightweight temporal filter assigns internal `track_id` values, estimates fallback velocity, and predicts through short missing-data gaps.",
+        "- The CSV is generated from this LiDAR/radar/temporal fusion pipeline; it does not read bag-provided object labels or image detections.",
         "",
         "## Per-Sensor Detection",
         "",
@@ -473,7 +675,7 @@ def _write_task2_report(
             f"| frames_with_rows | {timestamps} |",
             f"| nonzero_velocity_rows | {nonzero_velocity} |",
             f"| radar_associated_rows | {radar_rows} |",
-            f"| camera_validated_rows | {camera_rows} |",
+            f"| camera_projection_rows | {camera_projection_rows} |",
             f"| temporal_prediction_rows | {predicted_rows} |",
             f"| max_sources_per_row | {max_sources} |",
             f"| low_confidence_lt_0.50 | {low_conf} |",
@@ -499,12 +701,13 @@ def _write_task2_report(
             f"- Radar returns are not forced into tracks. In this {args.max_frames}-frame run, radar clusters that fail the spatial gate are rejected, so `n_radar=0` rows are honest non-associations.",
             f"- Camera topic: `{camera_topic}`",
             f"- Indexed camera timestamps: {camera_samples}",
-            "- Camera validation is projection gating, not image-object recognition.",
+            "- Camera validation is projection gating only; it is not counted in `sensors` or `n_camera` because no image-object detector is available.",
+            "- Camera verification images are selected from timestamps with multiple observed, in-image projected fusion rows and label each marker with internal track ID, distance, source, and timestamp.",
             "",
             "## Known Limitations",
             "",
             "- Radar fusion depends on spatially plausible radar detections; current sample data does not provide radar matches to the LiDAR vehicle clusters.",
-            "- Camera contribution is visibility validation because no calibrated image detector exists in the project.",
+            "- Camera projection uses approximate calibration and is reported only as a visual/timestamp sanity check; no 2-D camera boxes or ground-truth actor labels were found in the bag.",
             "- Velocity is ego-frame relative velocity; radar Doppler is preferred when matched, otherwise temporal frame differences are used.",
             "",
             "## Outputs",
@@ -512,6 +715,12 @@ def _write_task2_report(
             f"- CSV: `{(output_dir / 'fused_detections.csv').as_posix()}`",
         ]
     )
+    if side_lidar_zero:
+        insert_at = lines.index(f"- Camera topic: `{camera_topic}`")
+        lines.insert(
+            insert_at,
+            "- Side LiDAR returns are accepted only when clusters pass the same vehicle-shape filters; long guardrail-like strips are rejected instead of being forced into false vehicle detections.",
+        )
     lines.extend(f"- Visualisation: `{path.as_posix()}`" for path in generated_files)
     lines.extend(
         [
@@ -551,7 +760,7 @@ def main() -> None:
 
     topic_names = args.sensors or _DEFAULT_SENSORS
 
-    print("\n[Task 2] Running per-sensor detection …")
+    print("\n[Task 2] Running per-sensor detection ...")
     all_frames = detect_all_sensors(
         summary,
         config,
@@ -580,10 +789,10 @@ def main() -> None:
         except Exception as exc:  # noqa: BLE001
             print(f"[Task 2] ego.mat load failed: {exc}")
 
-    print("[Task 2] Computing oriented bounding boxes …")
+    print("[Task 2] Computing oriented bounding boxes ...")
     oriented_boxes = _build_oriented_boxes(all_frames, config)
 
-    print("[Task 2] Extracting radar Doppler velocities …")
+    print("[Task 2] Extracting radar Doppler velocities ...")
     doppler_vel = _build_doppler_vel(all_frames, summary, config, ego_log)
 
     camera_index = None
@@ -615,7 +824,7 @@ def main() -> None:
         )
         return
 
-    print("[Task 2] Running fusion …")
+    print("[Task 2] Running fusion ...")
     df = run_fusion(
         all_frames,
         master_topic=_MASTER_TOPIC,
@@ -626,7 +835,7 @@ def main() -> None:
 
     csv_path = output_dir / "fused_detections.csv"
     df.to_csv(csv_path, index=False)
-    print(f"[Task 2] Fused detections saved → {csv_path.as_posix()}")
+    print(f"[Task 2] Fused detections saved -> {csv_path.as_posix()}")
     print(f"         {len(df)} rows | columns: {list(df.columns)}")
 
     # BEV plots
@@ -634,7 +843,7 @@ def main() -> None:
     n_plots = min(args.bev_frames, len(master_frames))
     generated_files: list[Path] = []
     if n_plots > 0:
-        print(f"[Task 2] Saving {n_plots} BEV fusion plots …")
+        print(f"[Task 2] Saving {n_plots} BEV fusion plots ...")
         for idx in range(n_plots):
             fr = master_frames[idx]
             ts = fr.timestamp_ns
@@ -652,7 +861,7 @@ def main() -> None:
             generated_files.append(plot_path)
             print(f"  {plot_path.as_posix()}")
 
-    print("[Task 2] Regenerating verification visualisations …")
+    print("[Task 2] Regenerating verification visualisations ...")
     lidar_overlay = _save_lidar_overlay(all_frames, output_dir)
     generated_files.append(lidar_overlay)
     camera_projection = _save_camera_projection(
@@ -661,7 +870,7 @@ def main() -> None:
         output_dir,
         args.camera_topic,
     )
-    generated_files.append(camera_projection)
+    generated_files.extend(camera_projection)
     report_path = _write_task2_report(
         summary,
         all_frames,
@@ -672,8 +881,9 @@ def main() -> None:
         args=args,
     )
     print(f"  {lidar_overlay.as_posix()}")
-    print(f"  {camera_projection.as_posix()}")
-    print(f"[Task 2] Report saved → {report_path.as_posix()}")
+    for path in camera_projection:
+        print(f"  {path.as_posix()}")
+    print(f"[Task 2] Report saved -> {report_path.as_posix()}")
 
     print("\n[Task 2] Done.")
     print(f"  Sensors processed : {list(all_frames.keys())}")
