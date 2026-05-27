@@ -137,26 +137,28 @@ Per-sensor measurement noise R (reused from Task 2):
 | LiDAR  |                        0.5 | 9.0 (no Doppler)                  |
 | Radar  |                        4.0 | 0.4 (good Doppler)                |
 
-## Results (60 frames, all 7 sensors)
+## Results (200 frames, all 7 sensors)
 
-| Metric                                    |    Value |
-| :---------------------------------------- | -------: |
-| Master-clock frames                       |      60 |
-| Raw sensor detections                     |     866 |
-| Total unique track IDs created            |     218 |
-| Confirmed tracks (>= 3 hits)              |     169 |
-| Track-rows emitted in tracks.csv          |     864 |
-| Tracks with >= 20 observed frames         |       7 |
-| Tracks with >= 10 observed frames         |      54 |
-| Mean confirmed track lifetime (obs)       | 6.9 frames |
-| Mean coasting frames per track            | 1.6 frames |
-| Coasting fraction of emitted rows         |    37.0% |
-| Probable ID switches (proximity proxy)    |      12 |
+| Metric                                    |     Value |
+| :---------------------------------------- | --------: |
+| Master-clock frames                       |       200 |
+| Raw sensor detections                     |     2 789 |
+| Total unique track IDs created            |       627 |
+| Confirmed tracks (>= 3 hits)              |       510 |
+| Track-rows emitted in tracks.csv          |     2 752 |
+| Tracks with >= 30 observed frames         |         9 |
+| Tracks with >= 20 observed frames         |        33 |
+| Tracks with >= 10 observed frames         |       144 |
+| Mean confirmed track lifetime (obs)       | 7.3 frames |
+| Mean coasting frames per track            | 2.2 frames |
+| Coasting fraction of emitted rows         |     45.3% |
+| Probable ID switches (proximity proxy)    |        42 |
 
-The longest tracks are T27 (30 obs, 9 coasted), T88 (28 obs, 7 coasted), T82 (25 obs, 15
-coasted), T143 (22 obs), and T68 (21 obs), all at relative speeds of 11-15 m/s consistent with
-opponent vehicles in close convoy racing. Both LiDAR and radar contribute to the sensor mix for
-multi-sensor tracks.
+The longest track is **T158** (49 observed frames, 21 coasted, 16.8 m/s mean speed), followed
+by T88 and T317 (35 obs each), T314 and T455 (34 obs each). Nine tracks exceed 30 observed
+frames across the 200-frame (~10 s) window. Mean relative speed of confirmed long tracks is
+8-17 m/s, consistent with opponent vehicles in IndyCar convoy racing. Both LiDAR and radar
+contribute to the sensor mixtures for multi-sensor tracks.
 
 ## Task 2 vs Task 3 comparison
 
@@ -166,7 +168,7 @@ multi-sensor tracks.
 | Identity across frames | none (per-frame ID)               | stable integer track_id         |
 | Occlusion handling     | none                              | coasting up to max_age=8 frames |
 | Ego-motion compensation | no (single-frame)                | yes (world-frame predict)       |
-| Total rows (60 frames) | ~918 fused                        | 864 (confirmed + coasting)      |
+| Total rows (200 frames) | ~918 fused (task2 run)           | 2 752 (confirmed + coasting)    |
 | Velocity estimate      | 0.0 (LiDAR-only) or radar Doppler | EKF-fused from track history    |
 
 ## Occlusion Recovery
@@ -226,11 +228,11 @@ gaps without creating a new tentative track.
 ## Reproducing Results
 
 ```bash
-# Full 60-frame run
-uv run python scripts/run_task3.py --bag-dir data --max-frames 60 --bev-frames 5
+# Full 200-frame run (matches Task 2 coverage)
+uv run python scripts/run_task3.py --bag-dir data --max-frames 200 --bev-frames 5
 
 # Occlusion recovery demo (5-frame blank at frame 20)
-uv run python scripts/run_task3.py --bag-dir data --max-frames 60 \
+uv run python scripts/run_task3.py --bag-dir data --max-frames 200 \
     --simulate-occlusion 5 --occlusion-start 20 --bev-frames 0
 
 # Motion model unit tests
