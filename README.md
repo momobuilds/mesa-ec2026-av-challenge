@@ -1,4 +1,5 @@
 # MESA EC2026 AV Challenge
+<img width="796" height="1125" alt="image" src="https://github.com/user-attachments/assets/934a488f-c4bc-4836-b011-6444a36b7b62" />
 
 ## Task 1: Opponent Vehicle Detection
 
