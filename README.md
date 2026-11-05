@@ -1,6 +1,12 @@
 # MESA EC2026 AV Challenge
 <img width="796" height="1125" alt="image" src="https://github.com/user-attachments/assets/934a488f-c4bc-4836-b011-6444a36b7b62" />
 
+Team project for the **MESA EC2026 Autonomous Vehicle Challenge**: a perception → tracking → prediction → planning pipeline built directly on ROS 2 bag data (3 LiDARs, 4 radars, cameras) from an autonomous race car, without needing a ROS 2 install.
+
+**Team:** Aman Zargari, Mobin Khatib, Mo Moazen ([@momobuilds](https://github.com/momobuilds))
+
+**My contribution:** repository setup and project structure; **Task 2 multi-sensor fusion**, extending detection to radar (Doppler velocity association) and adding output validation (`src/task2_fusion.py`, `scripts/run_task2.py`, `scripts/validate_task2_outputs.py`); and the **end-to-end demo video** of Tasks 1–7 (`demo/generate_demo_video.py`).
+
 ## Task 1: Opponent Vehicle Detection
 
 This repository includes a Task 1 pipeline that inspects the ROS 2 bag metadata,
